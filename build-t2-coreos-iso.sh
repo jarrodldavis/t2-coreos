@@ -39,6 +39,27 @@ set -euo pipefail
 # Kernel args for the *live installer* environment, if it needs help booting.
 : "${LIVE_KARGS:=}"
 
+# Root shell on tty9 in the live environment. On by default: if the
+# installer fails it trips OnFailure=emergency.target, and because FCOS
+# locks the root account sulogin gives you nothing -- no shell, no logs.
+# debug-shell.service sets IgnoreOnIsolate=yes, so it survives that
+# isolation and stays reachable at Ctrl-Alt-F9. Set 0 to disable.
+: "${LIVE_DEBUG_SHELL:=1}"
+
+# Forward the journal to the console in the live environment. Without
+# this, a failing coreos-installer.service prints only systemd's [FAILED]
+# line and the actual error stays in a journal you may have no shell to
+# read.
+#
+# This also disables systemd's own status output. Both PID 1 and journald
+# write to /dev/console with no lock between them, and systemd's status
+# lines use ANSI cursor positioning, so leaving both on interleaves and
+# garbles them. PID 1's own failure messages still reach the console --
+# they go through the journal, which is what we are forwarding.
+#
+# Set 0 to get stock behaviour back (status lines, no log forwarding).
+: "${LIVE_VERBOSE:=1}"
+
 COPR_OWNER=sharpenedblade
 COPR_PROJECT=t2linux
 COPR_BASE="https://download.copr.fedorainfracloud.org/results/${COPR_OWNER}/${COPR_PROJECT}"
@@ -130,7 +151,9 @@ fi
 #   1. nsswitch "resolve" -> nss-resolve talks to resolved directly
 #   2. resolv.conf -> 127.0.0.53 stub, which also answers mDNS
 # --------------------------------------------------------------------
-T2_PKGS="t2fanrd rust-tiny-dfr t2linux-audio"
+# Binary package is "tiny-dfr"; "rust-tiny-dfr" is only the source
+# package name and will not resolve. Override to taste.
+: "${T2_PKGS:=t2fanrd tiny-dfr t2linux-audio}"
 MDNS_FILES=""
 MDNS_DRACUT_ARGS=""
 if [[ "$TANG_MDNS" == "1" ]]; then
@@ -335,7 +358,16 @@ $MDNS_FILES
             --experimental \\
             --from repo=copr:copr.fedorainfracloud.org:$COPR_OWNER:$COPR_PROJECT \\
             kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra
-          rpm-ostree install -y $T2_PKGS
+          # Userspace extras are optional. The kernel override above is
+          # the part that matters and has already succeeded by this point,
+          # so a drifted package name must not fail the unit and strand the
+          # machine on a stock kernel. Try together, then one at a time.
+          if ! rpm-ostree install -y $T2_PKGS; then
+            echo "t2-enablement: bulk install failed, retrying individually" >&2
+            for pkg in $T2_PKGS; do
+              rpm-ostree install -y "\$pkg" || echo "t2-enablement: SKIPPED \$pkg" >&2
+            done
+          fi
 
           touch /var/lib/t2-enablement.stamp
           systemctl reboot
@@ -353,25 +385,47 @@ $MDNS_FILES
       contents:
         inline: |
           #!/bin/bash
-          set -euo pipefail
+          # Enroll a real passphrase, then drop the throwaway install key.
+          #
+          # Deliberately does NOT use systemd-ask-password: that routes
+          # through the password-agent system, which needs an agent already
+          # running and times out at 90s if none answers. cryptsetup prompts
+          # on its own controlling tty, which the unit binds to /dev/console.
+          set -uo pipefail
           DEV=/dev/disk/by-partlabel/root
           INSTALL_KEY=/etc/luks-install.key
-          [[ -f \$INSTALL_KEY ]] || { echo "already enrolled"; exit 0; }
+          [[ -f "\$INSTALL_KEY" ]] || { echo "luks-enroll: already enrolled"; exit 0; }
 
-          for i in 1 2 3; do
-            P1=\$(systemd-ask-password --no-tty "Set a LUKS passphrase for this disk:") || exit 1
-            P2=\$(systemd-ask-password --no-tty "Confirm passphrase:") || exit 1
-            [[ "\$P1" == "\$P2" && -n "\$P1" ]] && break
-            echo "Passphrases did not match, try again." >&2
-            P1=""
+          echo
+          echo "==================================================="
+          echo " Set a LUKS passphrase for this disk."
+          echo " Until this is done the only key is a throwaway one,"
+          echo " and the machine will not survive a reboot."
+          echo "==================================================="
+          echo
+
+          for attempt in 1 2 3; do
+            if cryptsetup luksAddKey --key-file "\$INSTALL_KEY" "\$DEV"; then
+              # Never drop the install key on the strength of luksAddKey's
+              # exit status alone -- confirm a second keyslot really exists,
+              # because removing the only key bricks the disk.
+              slots=\$(cryptsetup luksDump "\$DEV" | grep -cE '^[[:space:]]+[0-9]+: luks2')
+              if [ "\$slots" -lt 2 ]; then
+                echo "luks-enroll: expected >=2 keyslots, found \$slots; refusing to remove the install key." >&2
+                exit 1
+              fi
+              if cryptsetup luksRemoveKey --batch-mode --key-file "\$INSTALL_KEY" "\$DEV"; then
+                shred -u "\$INSTALL_KEY"
+                echo "luks-enroll: passphrase enrolled, install key removed."
+                exit 0
+              fi
+              echo "luks-enroll: could not remove the install key." >&2
+              exit 1
+            fi
+            echo "luks-enroll: attempt \$attempt failed, try again." >&2
           done
-          [[ -n "\$P1" ]] || { echo "giving up" >&2; exit 1; }
-
-          printf '%s\\n' "\$P1" | cryptsetup luksAddKey --batch-mode \\
-            --key-file "\$INSTALL_KEY" "\$DEV" -
-          cryptsetup luksRemoveKey --batch-mode --key-file "\$INSTALL_KEY" "\$DEV"
-          shred -u "\$INSTALL_KEY"
-          echo "Passphrase enrolled; install key removed."
+          echo "luks-enroll: giving up. Run 'sudo /usr/local/bin/luks-enroll' by hand." >&2
+          exit 1
 EOF
 
 # In enroll mode, drop the install key onto the (encrypted) root so the
@@ -426,17 +480,24 @@ cat >> "$BU" <<EOF
       contents: |
         [Unit]
         Description=Enroll a LUKS passphrase and drop the install key
-        DefaultDependencies=no
-        After=basic.target
-        Before=t2-enablement.service
+        After=systemd-user-sessions.service plymouth-quit-wait.service
+        Before=t2-enablement.service getty@tty1.service
+        Conflicts=getty@tty1.service
         ConditionPathExists=/etc/luks-install.key
 
         [Service]
         Type=oneshot
         RemainAfterExit=yes
         ExecStart=/usr/local/bin/luks-enroll
-        StandardOutput=journal+console
+        # Give cryptsetup a real controlling terminal to prompt on, and
+        # take it away from getty so the two do not fight over the console.
+        StandardInput=tty-force
+        StandardOutput=tty
         StandardError=journal+console
+        TTYPath=/dev/console
+        TTYReset=yes
+        TTYVHangup=yes
+        TimeoutStartSec=infinity
 
         [Install]
         WantedBy=multi-user.target
@@ -469,6 +530,41 @@ else
   }
 fi
 
+# Quoted heredoc: nothing expands at build time. The one build-time
+# value, the target device, goes in via a placeholder afterwards.
+cat > "$WORK/pre-install.sh" <<'PRE'
+#!/bin/bash
+# Runs in the live env before coreos-installer touches the target.
+# coreos-installer opens the destination O_EXCL and aborts if anything
+# else holds it. On a T2 the Apple containers get probed at boot, so udev
+# or an automount can still own the device when the installer starts.
+# Everything here is best-effort: a failing pre-install script drops the
+# live environment to an emergency shell, which is worse than a dirty target.
+set -u
+DEV="@@DISK@@"
+
+for _ in $(seq 1 30); do
+    [ -b "$DEV" ] && break
+    sleep 1
+done
+if [ ! -b "$DEV" ]; then
+    echo "pre-install: $DEV never appeared; leaving it to the installer" >&2
+    exit 0
+fi
+
+udevadm settle --timeout=60 || true
+for part in $(lsblk -lno NAME "$DEV" 2>/dev/null | tail -n +2); do
+    umount -f "/dev/$part" 2>/dev/null || true
+done
+swapoff -a 2>/dev/null || true
+wipefs -a "$DEV" 2>/dev/null || true
+udevadm settle --timeout=60 || true
+echo "pre-install: $DEV released"
+exit 0
+PRE
+sed -i "s|@@DISK@@|$DISK|g" "$WORK/pre-install.sh"
+chmod +x "$WORK/pre-install.sh"
+
 log "Transpiling Butane -> Ignition"
 run_butane --strict --files-dir "$W/files" "$W/config.bu" > "$WORK/config.ign"
 [[ -s "$WORK/config.ign" ]] || die "butane produced an empty config"
@@ -485,9 +581,17 @@ CUSTOMIZE_ARGS=(
   iso customize
   --dest-ignition "$W/config.ign"
   --dest-device "$DISK"
+  --pre-install "$W/pre-install.sh"
   -o "$O/$(basename "$OUT_ISO")"
 )
 for k in $LIVE_KARGS; do CUSTOMIZE_ARGS+=(--live-karg-append "$k"); done
+[[ "$LIVE_DEBUG_SHELL" == "1" ]] && CUSTOMIZE_ARGS+=(--live-karg-append systemd.debug_shell=1)
+if [[ "$LIVE_VERBOSE" == "1" ]]; then
+  CUSTOMIZE_ARGS+=(--live-karg-append systemd.journald.forward_to_console=1)
+  # Keep PID 1 off /dev/console so its status lines cannot interleave
+  # with the forwarded log stream.
+  CUSTOMIZE_ARGS+=(--live-karg-append systemd.show_status=false)
+fi
 CUSTOMIZE_ARGS+=("$O/$(basename "$BASE_ISO")")
 
 log "Building self-installing ISO (target: $DISK)"
@@ -503,4 +607,19 @@ $(log "Done")
   LUKS:   $LUKS_MODE${TANG_URL:+ + tang at $TANG_URL}$( [[ "$TANG_MDNS" == "1" ]] && echo " (mDNS resolver in initramfs)" )
 
 Write it with:  sudo dd if=$OUT_ISO of=/dev/diskN bs=4M status=progress oflag=direct
+$( [[ "$LIVE_DEBUG_SHELL" == "1" ]] && cat <<'TIP'
+
+If the install fails, the error is printed to the console directly --
+no keypresses needed. The live environment then stops at an emergency
+prompt that offers no shell, because FCOS locks the root account.
+
+A root shell is waiting on tty9. On a Touch Bar Mac there are no F-keys
+in the live environment (the Touch Bar needs the t2 kernel, which is not
+installed yet), so Ctrl-Alt-F9 is not available. Instead either:
+  - press Alt+Right to cycle forward through the VTs to tty9, or
+  - plug in an external USB keyboard, which has real F-keys.
+Then run:
+  journalctl -b -u coreos-installer --no-pager
+TIP
+)
 EOF
