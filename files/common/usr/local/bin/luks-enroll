@@ -1,0 +1,42 @@
+#!/bin/bash
+# Enroll a real passphrase, then drop the throwaway install key.
+#
+# cryptsetup prompts on its own controlling tty. The systemd unit binds the
+# service to /dev/console so no password-agent setup is required.
+set -uo pipefail
+
+DEV=/dev/disk/by-partlabel/root
+INSTALL_KEY=/etc/luks-install.key
+[[ -f "$INSTALL_KEY" ]] || { echo "luks-enroll: already enrolled"; exit 0; }
+
+echo
+echo "==================================================="
+echo " Set a LUKS passphrase for this disk."
+echo " Until this is done the only key is a throwaway one,"
+echo " and the machine will not survive a reboot."
+echo "==================================================="
+echo
+
+for attempt in 1 2 3; do
+    if cryptsetup luksAddKey --key-file "$INSTALL_KEY" "$DEV"; then
+        slots=$(cryptsetup luksDump "$DEV" | grep -cE '^[[:space:]]+[0-9]+: luks2')
+        if [ "$slots" -lt 2 ]; then
+            echo "luks-enroll: expected >=2 keyslots, found $slots; refusing to remove the install key." >&2
+            exit 1
+        fi
+
+        if cryptsetup luksRemoveKey --batch-mode --key-file "$INSTALL_KEY" "$DEV"; then
+            shred -u "$INSTALL_KEY"
+            echo "luks-enroll: passphrase enrolled, install key removed."
+            exit 0
+        fi
+
+        echo "luks-enroll: could not remove the install key." >&2
+        exit 1
+    fi
+
+    echo "luks-enroll: attempt $attempt failed, try again." >&2
+done
+
+echo "luks-enroll: giving up. Run 'sudo /usr/local/bin/luks-enroll' by hand." >&2
+exit 1

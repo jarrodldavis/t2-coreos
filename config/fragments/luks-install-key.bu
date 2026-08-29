@@ -1,0 +1,4 @@
+    - path: /etc/luks-install.key
+      mode: 0600
+      contents:
+        local: luks.key

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Runs in the live environment before coreos-installer touches the target.
+# Everything here is best-effort: a failed pre-install hook drops the live
+# environment into emergency mode, which is less useful than letting the
+# installer report its own error.
+set -u
+
+DEV="@@DISK@@"
+
+for _ in $(seq 1 30); do
+    [ -b "$DEV" ] && break
+    sleep 1
+done
+
+if [ ! -b "$DEV" ]; then
+    echo "pre-install: $DEV never appeared; leaving it to the installer" >&2
+    exit 0
+fi
+
+udevadm settle --timeout=60 || true
+for part in $(lsblk -lno NAME "$DEV" 2>/dev/null | tail -n +2); do
+    umount -f "/dev/$part" 2>/dev/null || true
+done
+swapoff -a 2>/dev/null || true
+wipefs -a "$DEV" 2>/dev/null || true
+udevadm settle --timeout=60 || true
+
+echo "pre-install: $DEV released"

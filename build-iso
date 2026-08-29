@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+
+import base64
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+COPR_OWNER = "sharpenedblade"
+COPR_PROJECT = "t2linux"
+COPR_BASE = f"https://download.copr.fedorainfracloud.org/results/{COPR_OWNER}/{COPR_PROJECT}"
+COPR_REPO = f"copr:copr.fedorainfracloud.org:{COPR_OWNER}:{COPR_PROJECT}"
+
+BUTANE_IMG = "quay.io/coreos/butane:release"
+INSTALLER_IMG = "quay.io/coreos/coreos-installer:release"
+
+
+def log(message: str) -> None:
+    print(f"\033[1;34m==>\033[0m {message}")
+
+
+def die(message: str) -> None:
+    print(f"\033[1;31merror:\033[0m {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def require_command(command: str, message: str) -> None:
+    if shutil.which(command) is None:
+        die(message)
+
+
+def render(path: Path, replacements: dict[str, str]) -> str:
+    text = path.read_text()
+    for name, value in replacements.items():
+        text = text.replace(f"@@{name}@@", value)
+
+    if "@@" in text:
+        die(f"unresolved template placeholder in {path}")
+    return text
+
+
+def copy_tree(source: Path, destination: Path) -> None:
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def read_ssh_key(value: str) -> str:
+    path = Path(value).expanduser()
+    if path.is_file():
+        value = path.read_text()
+
+    key = value.splitlines()[0] if value else ""
+    if not (key.startswith("ssh-") or key.startswith("ecdsa-")):
+        die("SSH_KEY does not look like a public key")
+    return key
+
+
+def write_enablement_config(path: Path, t2_packages: str, tang_mdns: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"COPR_REPO={shlex.quote(COPR_REPO)}\n"
+        f"T2_PKGS={shlex.quote(t2_packages)}\n"
+        f"TANG_MDNS={shlex.quote(tang_mdns)}\n"
+    )
+
+
+def main() -> None:
+    ssh_key_setting = os.environ.get("SSH_KEY")
+    if not ssh_key_setting:
+        die("set SSH_KEY to your public key file or literal key")
+
+    disk = os.environ.get("DISK", "/dev/nvme0n1")
+    stream = os.environ.get("STREAM", "stable")
+    hostname = os.environ.get("FCOS_HOSTNAME", "t2mac")
+    out_setting = Path(os.environ.get("OUTDIR", "./out")).expanduser()
+
+    luks_mode = os.environ.get("LUKS_MODE", "enroll")
+    luks_passphrase = os.environ.get("LUKS_PASSPHRASE", "")
+    tang_url = os.environ.get("TANG_URL", "")
+    tang_thumbprint = os.environ.get("TANG_THUMBPRINT", "")
+    tang_mdns = os.environ.get("TANG_MDNS", "auto")
+
+    live_kargs = os.environ.get("LIVE_KARGS", "")
+    live_debug_shell = os.environ.get("LIVE_DEBUG_SHELL", "1")
+    live_verbose = os.environ.get("LIVE_VERBOSE", "1")
+    t2_packages = os.environ.get("T2_PKGS", "t2fanrd tiny-dfr t2linux-audio")
+    native = os.environ.get("NATIVE", "0") == "1"
+
+    if luks_mode not in {"enroll", "embed"}:
+        die("LUKS_MODE must be 'enroll' or 'embed'")
+    if luks_mode == "embed" and not luks_passphrase:
+        die("LUKS_MODE=embed requires LUKS_PASSPHRASE")
+    if tang_url and not tang_thumbprint:
+        die("TANG_URL requires TANG_THUMBPRINT (get it: clevis-encrypt-tang or tang-show-keys)")
+
+    if tang_mdns == "auto":
+        tang_mdns = "1" if ".local" in tang_url else "0"
+    if tang_mdns == "1" and not tang_url:
+        die("TANG_MDNS=1 without TANG_URL")
+
+    if tang_mdns == "1":
+        t2_packages = f"{t2_packages} systemd-resolved"
+
+    require_command("curl", "curl not found")
+    if native:
+        require_command("butane", "butane not found (unset NATIVE to use podman)")
+        require_command("coreos-installer", "coreos-installer not found")
+    else:
+        require_command("podman", "podman not found (or set NATIVE=1)")
+
+    ssh_key = read_ssh_key(ssh_key_setting)
+
+    out_setting.mkdir(parents=True, exist_ok=True)
+    out_dir = out_setting.resolve()
+
+    with tempfile.TemporaryDirectory(prefix="t2-coreos-") as temp:
+        work = Path(temp)
+        files_dir = work / "files"
+        rootfs = files_dir / "rootfs"
+        rootfs.mkdir(parents=True)
+        os.chmod(work, 0o700)
+        os.chmod(files_dir, 0o700)
+
+        copy_tree(ROOT / "files/common", rootfs)
+        if tang_mdns == "1":
+            copy_tree(ROOT / "files/mdns", rootfs)
+
+        (rootfs / "etc").mkdir(parents=True, exist_ok=True)
+        (rootfs / "etc/hostname").write_text(f"{hostname}\n")
+
+        repo_path = rootfs / "etc/yum.repos.d/t2linux.repo"
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        repo_path.write_text(
+            render(
+                ROOT / "templates/t2linux.repo.in",
+                {
+                    "COPR_OWNER": COPR_OWNER,
+                    "COPR_PROJECT": COPR_PROJECT,
+                    "COPR_BASE": COPR_BASE,
+                },
+            )
+        )
+
+        write_enablement_config(rootfs / "etc/t2-coreos/t2-enablement.conf", t2_packages, tang_mdns)
+
+        luks_key = files_dir / "luks.key"
+        if luks_mode == "embed":
+            luks_key.write_text(luks_passphrase)
+        else:
+            luks_key.write_bytes(base64.b64encode(os.urandom(48)))
+        os.chmod(luks_key, 0o600)
+
+        gpg_path = rootfs / "etc/pki/rpm-gpg/RPM-GPG-KEY-t2linux"
+        gpg_path.parent.mkdir(parents=True, exist_ok=True)
+        gpg_source = os.environ.get("COPR_GPG_KEY_FILE")
+        if gpg_source:
+            log(f"Using COPR signing key from {gpg_source}")
+            shutil.copyfile(Path(gpg_source).expanduser(), gpg_path)
+        else:
+            log("Fetching t2linux COPR signing key")
+            result = subprocess.run(
+                ["curl", "-fsSL", f"{COPR_BASE}/pubkey.gpg", "-o", str(gpg_path)],
+                check=False,
+            )
+            if result.returncode != 0:
+                die(
+                    "could not fetch COPR signing key. Download it manually from\n"
+                    f"   {COPR_BASE}/pubkey.gpg\n"
+                    "and re-run with COPR_GPG_KEY_FILE=/path/to/pubkey.gpg"
+                )
+
+        if "BEGIN PGP PUBLIC KEY" not in gpg_path.read_text(errors="replace"):
+            die("COPR key file does not look like an ASCII-armored PGP key")
+
+        clevis_block = ""
+        if tang_url:
+            clevis_block = (
+                "      clevis:\n"
+                "        tang:\n"
+                f"          - url: {json.dumps(tang_url)}\n"
+                f"            thumbprint: {json.dumps(tang_thumbprint)}"
+            )
+
+        storage_files = []
+        if luks_mode == "enroll":
+            storage_files.append((ROOT / "config/fragments/luks-install-key.bu").read_text().rstrip())
+        if tang_mdns == "1":
+            storage_files.append((ROOT / "config/fragments/mdns-overrides.bu").read_text().rstrip())
+
+        systemd_units = []
+        if luks_mode == "enroll":
+            systemd_units.append((ROOT / "config/fragments/luks-enroll-unit.bu").read_text().rstrip())
+
+        rendered_butane = render(
+            ROOT / "config/destination.bu.in",
+            {
+                "SSH_KEY": json.dumps(ssh_key),
+                "CLEVIS_BLOCK": clevis_block,
+                "OPTIONAL_STORAGE_FILES": "\n".join(storage_files),
+                "OPTIONAL_SYSTEMD_UNITS": "\n".join(systemd_units),
+            },
+        )
+
+        butane_output = out_dir / "t2-fcos.bu"
+        butane_output.write_text(rendered_butane)
+        shutil.copyfile(butane_output, work / "config.bu")
+
+        pre_install = render(ROOT / "installer/pre-install.sh.in", {"DISK": disk})
+        pre_install_path = work / "pre-install.sh"
+        pre_install_path.write_text(pre_install)
+        os.chmod(pre_install_path, 0o755)
+
+        if native:
+            work_arg = str(work)
+            out_arg = str(out_dir)
+
+            def run_butane(args: list[str], *, stdout=None) -> None:
+                subprocess.run(["butane", *args], check=True, stdout=stdout)
+
+            def run_installer(args: list[str]) -> None:
+                subprocess.run(["coreos-installer", *args], check=True)
+        else:
+            work_arg = "/w"
+            out_arg = "/out"
+
+            def run_butane(args: list[str], *, stdout=None) -> None:
+                subprocess.run(
+                    [
+                        "podman", "run", "--rm", "-i", "--security-opt", "label=disable",
+                        "-v", f"{work}:/w:z", "-w", "/w", BUTANE_IMG, *args,
+                    ],
+                    check=True,
+                    stdout=stdout,
+                )
+
+            def run_installer(args: list[str]) -> None:
+                subprocess.run(
+                    [
+                        "podman", "run", "--rm", "-i", "--security-opt", "label=disable", "--pull=always",
+                        "-v", f"{work}:/w:z", "-v", f"{out_dir}:/out:z", "-w", "/w", INSTALLER_IMG, *args,
+                    ],
+                    check=True,
+                )
+
+        ignition_path = work / "config.ign"
+        log("Transpiling Butane -> Ignition")
+        with ignition_path.open("wb") as output:
+            run_butane(["--strict", "--files-dir", f"{work_arg}/files", f"{work_arg}/config.bu"], stdout=output)
+        if ignition_path.stat().st_size == 0:
+            die("butane produced an empty config")
+
+        log(f"Downloading Fedora CoreOS {stream} live ISO")
+        run_installer(["download", "-s", stream, "-p", "metal", "-f", "iso", "-C", out_arg])
+
+        images = list(out_dir.glob("fedora-coreos-*-live*.iso"))
+        if not images:
+            die("coreos-installer download did not produce a live ISO")
+        base_iso = max(images, key=lambda path: path.stat().st_mtime)
+        log(f"Base image: {base_iso.name}")
+
+        output_iso = out_dir / "t2-coreos-installer.iso"
+        output_iso.unlink(missing_ok=True)
+
+        customize_args = [
+            "iso", "customize",
+            "--dest-ignition", f"{work_arg}/config.ign",
+            "--dest-device", disk,
+            "--pre-install", f"{work_arg}/pre-install.sh",
+            "-o", f"{out_arg}/{output_iso.name}",
+        ]
+        for karg in shlex.split(live_kargs):
+            customize_args += ["--live-karg-append", karg]
+        if live_debug_shell == "1":
+            customize_args += ["--live-karg-append", "systemd.debug_shell=1"]
+        if live_verbose == "1":
+            customize_args += ["--live-karg-append", "systemd.journald.forward_to_console=1"]
+            customize_args += ["--live-karg-append", "systemd.show_status=false"]
+        customize_args.append(f"{out_arg}/{base_iso.name}")
+
+        log(f"Building self-installing ISO (target: {disk})")
+        run_installer(customize_args)
+
+    print()
+    log("Done")
+    print()
+    print(f"  ISO:    {out_setting / 't2-coreos-installer.iso'}")
+    print(f"  Config: {out_setting / 't2-fcos.bu'}")
+    print(f"  Target: {disk}      -- WILL BE ERASED WITHOUT PROMPTING")
+    luks_summary = luks_mode
+    if tang_url:
+        luks_summary += f" + tang at {tang_url}"
+    if tang_mdns == "1":
+        luks_summary += " (mDNS resolver in initramfs)"
+    print(f"  LUKS:   {luks_summary}")
+    print()
+    print(f"Write it with:  sudo dd if={out_setting / 't2-coreos-installer.iso'} of=/dev/diskN bs=4M status=progress oflag=direct")
+
+    if live_debug_shell == "1":
+        print(
+            """
+If the install fails, the error is printed to the console directly.
+A root shell is waiting on tty9. On a Touch Bar Mac, use Alt+Right to
+cycle through the VTs or use an external keyboard with real F-keys.
+Then run:
+  journalctl -b -u coreos-installer --no-pager"""
+        )
+
+
+if __name__ == "__main__":
+    main()

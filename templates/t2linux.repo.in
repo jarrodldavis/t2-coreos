@@ -1,0 +1,10 @@
+[copr:copr.fedorainfracloud.org:@@COPR_OWNER@@:@@COPR_PROJECT@@]
+name=Copr repo for @@COPR_PROJECT@@ owned by @@COPR_OWNER@@
+baseurl=@@COPR_BASE@@/fedora-$releasever-$basearch/
+type=rpm-md
+skip_if_unavailable=False
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-t2linux
+repo_gpgcheck=0
+enabled=1
+priority=80

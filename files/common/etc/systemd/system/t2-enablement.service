@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply t2linux kernel and packages on first boot
+Wants=network-online.target
+After=network-online.target luks-enroll.service
+ConditionPathExists=!/var/lib/t2-enablement.stamp
+ConditionPathExists=!/etc/luks-install.key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/t2-enablement
+
+[Install]
+WantedBy=multi-user.target

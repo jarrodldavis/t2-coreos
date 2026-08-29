@@ -1,0 +1,6 @@
+[updates]
+strategy = "periodic"
+[[updates.periodic.window]]
+days = [ "Sat" ]
+start_time = "03:00"
+length_minutes = 120

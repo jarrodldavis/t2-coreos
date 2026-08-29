@@ -1,0 +1,60 @@
+variant: fcos
+version: 1.7.0
+
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys:
+        - @@SSH_KEY@@
+
+storage:
+  disks:
+    - device: /dev/disk/by-id/coreos-boot-disk
+      wipe_table: false
+      partitions:
+        - label: root
+          number: 4
+          size_mib: 0
+          resize: true
+
+  luks:
+    - name: root
+      label: luks-root
+      device: /dev/disk/by-partlabel/root
+      wipe_volume: true
+      discard: true
+      key_file:
+        local: luks.key
+@@CLEVIS_BLOCK@@
+
+  filesystems:
+    - device: /dev/mapper/root
+      format: xfs
+      wipe_filesystem: true
+      label: root
+
+  directories:
+    - path: /var/lib/firmware/brcm
+      mode: 0755
+
+  trees:
+    - local: rootfs
+      path: /
+
+  files:
+    - path: /etc/hostname
+      mode: 0644
+@@OPTIONAL_STORAGE_FILES@@
+
+kernel_arguments:
+  should_exist:
+    - intel_iommu=on
+    - iommu=pt
+    - mem_sleep_default=s2idle
+    - firmware_class.path=/var/lib/firmware
+
+systemd:
+  units:
+    - name: t2-enablement.service
+      enabled: true
+@@OPTIONAL_SYSTEMD_UNITS@@

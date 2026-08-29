@@ -1,0 +1,3 @@
+    - path: /etc/nsswitch.conf
+      mode: 0644
+      overwrite: true

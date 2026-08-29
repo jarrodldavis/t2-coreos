@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+source /etc/t2-coreos/t2-enablement.conf
+
+systemctl stop zincati.service || true
+
+initramfs_args=(--enable)
+if [[ "$TANG_MDNS" == 1 ]]; then
+    initramfs_args+=(--arg=-I --arg=/etc/nsswitch.conf)
+fi
+rpm-ostree initramfs "${initramfs_args[@]}"
+
+rpm-ostree override replace \
+    --experimental \
+    --from repo="$COPR_REPO" \
+    kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra
+
+read -r -a packages <<< "$T2_PKGS"
+if ((${#packages[@]})) && ! rpm-ostree install -y "${packages[@]}"; then
+    echo "t2-enablement: bulk install failed, retrying individually" >&2
+    for pkg in "${packages[@]}"; do
+        rpm-ostree install -y "$pkg" || echo "t2-enablement: SKIPPED $pkg" >&2
+    done
+fi
+
+touch /var/lib/t2-enablement.stamp
+systemctl reboot
