@@ -1,161 +1,142 @@
 # t2-coreos
 
-Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. The installed system uses the stock Fedora CoreOS image, then applies the t2linux kernel as a persistent rpm-ostree override on first boot.
+Builds Fedora CoreOS ISOs for an Intel T2 MacBook Pro.
 
-## Project layout
-
-```text
-.
-├── build-iso
-├── config/
-│   ├── destination.bu.in
-│   └── fragments/
-│       ├── luks-enroll-unit.bu
-│       ├── luks-install-key.bu
-│       └── mdns-overrides.bu
-├── files/
-│   ├── common/
-│   │   ├── etc/
-│   │   │   ├── dracut.conf.d/t2linux-modules.conf
-│   │   │   ├── modprobe.d/t2-eth-blocklist.conf
-│   │   │   ├── systemd/logind.conf.d/10-t2-no-suspend.conf
-│   │   │   ├── systemd/system/luks-enroll.service
-│   │   │   ├── systemd/system/t2-enablement.service
-│   │   │   └── zincati/config.d/55-updates-strategy.toml
-│   │   └── usr/local/bin/
-│   │       ├── luks-enroll
-│   │       └── t2-enablement
-│   └── mdns/
-│       └── etc/
-│           ├── NetworkManager/conf.d/10-mdns.conf
-│           ├── dracut.conf.d/40-mdns.conf
-│           ├── nsswitch.conf
-│           └── systemd/resolved.conf.d/10-mdns.conf
-├── installer/
-│   └── pre-install.sh.in
-└── templates/
-    └── t2linux.repo.in
-```
-
-`build-iso` is orchestration only. The installed filesystem content lives under `files/`, the Butane structure lives under `config/`, and the live-installer hook lives under `installer/`.
-
-The builder stages the selected filesystem trees into a temporary directory and embeds them with Butane `storage.trees`. The rendered Butane config is left in the output directory for inspection.
+Normal mode produces a self-installing ISO. `--diagnostic` produces a non-installing live ISO. The installed system starts from stock Fedora CoreOS and applies the t2linux kernel and userspace packages with rpm-ostree on first boot.
 
 ## Requirements
 
-By default:
-
 - Python 3
-- `curl`
 - Podman
+- `curl` for installer builds
 
-The builder uses:
+The default container images are:
 
 - `quay.io/coreos/butane:release`
 - `quay.io/coreos/coreos-installer:release`
 
-Set `NATIVE=1` to use locally installed `butane` and `coreos-installer` instead of Podman.
+Use `--native` to use local `butane` and `coreos-installer` binaries instead.
 
-## Build
+## Build an installer ISO
 
-`SSH_KEY` is required and can be either a public-key filename or the literal public key:
-
-```bash
-SSH_KEY=~/.ssh/id_ed25519.pub ./build-iso
-```
-
-For example:
+`--ssh-key` and `--tang-url` are required:
 
 ```bash
-SSH_KEY=~/.ssh/id_ed25519.pub \
-FCOS_HOSTNAME=t2-macbook \
-DISK=/dev/nvme0n1 \
-./build-iso
+./build-iso \
+    --ssh-key ~/.ssh/id_ed25519.pub \
+    --hostname t2-macbook \
+    --disk /dev/nvme0n1 \
+    --tang-url http://tang-server.local:7500
 ```
 
-The default output directory is `./out`:
+The installer runs automatically against the selected disk.
+
+Outputs are written under `out/`, including:
 
 ```text
-out/fedora-coreos-*-live-iso.x86_64.iso
-out/t2-fcos.bu
 out/t2-coreos-installer.iso
+out/t2-fcos.bu
+out/staging/
 ```
 
-The installer ISO automatically installs to `DISK` without confirmation.
+Run `./build-iso --help` for all options.
 
-## LUKS
+## LUKS and Tang
 
-`LUKS_MODE=enroll` is the default. Ignition creates the root LUKS volume using a random temporary key. On first boot, `luks-enroll.service` prompts for a permanent passphrase, confirms that a second keyslot exists, removes the temporary key, and deletes `/etc/luks-install.key`.
+Root encryption uses Butane's native `boot_device.luks` configuration with Tang. Ignition resizes the root partition to fill the disk during provisioning.
 
-To embed the permanent passphrase instead:
+The builder embeds the Tang advertisement for offline provisioning. If `--tang-thumbprint` is omitted, it derives the signing-key thumbprint from the advertisement.
 
-```bash
-LUKS_MODE=embed \
-LUKS_PASSPHRASE='...' \
-SSH_KEY=~/.ssh/id_ed25519.pub \
-./build-iso
-```
+`.local` Tang URLs enable the mDNS configuration automatically. Override this with `--tang-mdns=on` or `--tang-mdns=off`.
+mDNS Tang boots enable initramfs DHCP networking automatically. The internal T2 CDC-NCM interface is marked as non-NetworkManager-owned so it does not participate in DHCP or wait-online.
 
-In `embed` mode the passphrase is present in the generated installer material.
-
-## Tang
-
-Tang is optional. Set both the URL and signing-key thumbprint:
-
-```bash
-TANG_URL=http://tang-server.local:7500 \
-TANG_THUMBPRINT='<tang-signing-key-thumbprint>' \
-SSH_KEY=~/.ssh/id_ed25519.pub \
-./build-iso
-```
-
-`TANG_MDNS=auto` is the default. A `.local` Tang URL enables the files under `files/mdns/`, adds `systemd-resolved` to the first-boot package list, and tells rpm-ostree to include `/etc/nsswitch.conf` when regenerating the initramfs.
-
-Set `TANG_MDNS=0` or `TANG_MDNS=1` to override the automatic choice.
+A recovery passphrase can be enrolled manually after installation.
 
 ## T2 enablement
 
-`t2-enablement.service` runs after networking is online and after LUKS enrollment has completed. It:
+On first boot, `t2-enablement.service`:
 
-1. enables rpm-ostree initramfs regeneration;
-2. registers a repository-backed kernel override from the `sharpenedblade/t2linux` COPR;
-3. layers the configured T2 userspace packages;
-4. records `/var/lib/t2-enablement.stamp`;
-5. reboots into the pending T2 deployment.
+1. configures the `sharpenedblade/t2linux` repository;
+2. applies a persistent kernel override;
+3. layers the configured T2 packages;
+4. layers the FCOS dracut sysusers helper when mDNS Tang support is enabled;
+5. enables rpm-ostree initramfs regeneration.
 
-The default userspace packages are:
+The service reboots into the T2 deployment after successful enablement.
+
+User logins are held until first-boot T2 enablement succeeds and triggers a reboot.
+
+Default T2 packages:
 
 ```text
-t2fanrd tiny-dfr t2linux-audio
+t2fanrd
+tiny-dfr
+t2linux-audio
 ```
 
-Override them with `T2_PKGS`. When mDNS Tang support is enabled, `systemd-resolved` is appended automatically.
+Repeat `--t2-package PACKAGE` to replace the default set.
 
-## Build variables
+The generated initramfs force-loads:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SSH_KEY` | required | Public key file or literal key |
-| `DISK` | `/dev/nvme0n1` | Automatic install target |
-| `STREAM` | `stable` | FCOS stream |
-| `FCOS_HOSTNAME` | `t2mac` | Installed hostname |
-| `OUTDIR` | `./out` | Build output directory |
-| `LUKS_MODE` | `enroll` | `enroll` or `embed` |
-| `LUKS_PASSPHRASE` | empty | Required with `LUKS_MODE=embed` |
-| `TANG_URL` | empty | Optional Tang URL |
-| `TANG_THUMBPRINT` | empty | Required when `TANG_URL` is set |
-| `TANG_MDNS` | `auto` | `auto`, `0`, or `1` |
-| `T2_PKGS` | `t2fanrd tiny-dfr t2linux-audio` | Layered T2 packages |
-| `LIVE_KARGS` | empty | Extra live-installer kernel arguments |
-| `LIVE_DEBUG_SHELL` | `1` | Enable the live debug shell on tty9 |
-| `LIVE_VERBOSE` | `1` | Forward live journal output to the console |
-| `COPR_GPG_KEY_FILE` | empty | Use a local COPR public key instead of downloading it |
-| `NATIVE` | `0` | Use native Butane/coreos-installer when set to `1` |
+```text
+t2bce_dma
+t2bce_core
+t2bce_vhci
+```
 
-## Installer diagnostics
+When mDNS Tang support is enabled, `systemd-resolved` is also layered and included in the initramfs configuration.
 
-With the defaults, the live environment enables the systemd debug shell on tty9 and forwards the journal to the console. If installation fails, inspect the installer unit with:
+## Live installer settings
+
+The installer live environment adds:
+
+```text
+rd.driver.blacklist=applesmc
+modprobe.blacklist=applesmc
+```
+
+This prevents the stock `applesmc` driver from blocking udev on T2 hardware. The blacklist is not added to the installed system.
+
+The systemd debug shell is available on tty9.
+
+## Diagnostic ISO
+
+Build a non-installing live ISO with SSH access:
 
 ```bash
-journalctl -b -u coreos-installer --no-pager
+./build-iso \
+    --diagnostic \
+    --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+Output:
+
+```text
+out/t2-coreos-diagnostic.iso
+```
+
+Tang is not required in diagnostic mode. The default hostname is `t2-coreos-live`, SSH is enabled for `core`, and the systemd debug shell is available on tty9.
+
+Add live kernel arguments with repeated `--live-karg` options:
+
+```bash
+./build-iso \
+    --diagnostic \
+    --ssh-key ~/.ssh/id_ed25519.pub \
+    --live-karg rd.udev.log_level=debug \
+    --live-karg udev.log_level=debug
+```
+
+`--diagnostic-console-log` follows the journal on tty8.
+
+## Project layout
+
+```text
+build-iso                 build entry point
+config/                   Butane templates and fragments
+files/common/             files installed on every system
+files/mdns/               files used for mDNS Tang support
+installer/                live installer hook
+templates/                generated configuration templates
+out/staging/              rendered build inputs
 ```

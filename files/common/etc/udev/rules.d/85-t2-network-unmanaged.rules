@@ -1,0 +1,1 @@
+SUBSYSTEM=="net", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="8233", ENV{ID_NET_MANAGED_BY}="t2-internal"

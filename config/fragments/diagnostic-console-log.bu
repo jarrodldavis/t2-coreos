@@ -1,0 +1,19 @@
+    - name: diagnostic-journal.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Follow the live journal on tty8
+        After=systemd-journald.service
+
+        [Service]
+        ExecStart=/usr/bin/journalctl -b -f -o short-monotonic
+        StandardInput=null
+        StandardOutput=tty
+        StandardError=tty
+        TTYPath=/dev/tty8
+        TTYReset=yes
+        TTYVHangup=yes
+        Restart=always
+
+        [Install]
+        WantedBy=multi-user.target

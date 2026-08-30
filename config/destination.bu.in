@@ -7,31 +7,22 @@ passwd:
       ssh_authorized_keys:
         - @@SSH_KEY@@
 
+boot_device:
+  luks:
+    discard: true
+    tang:
+      - url: @@TANG_URL@@
+        thumbprint: @@TANG_THUMBPRINT@@
+        advertisement: @@TANG_ADVERTISEMENT@@
+
 storage:
   disks:
     - device: /dev/disk/by-id/coreos-boot-disk
-      wipe_table: false
       partitions:
-        - label: root
-          number: 4
+        - number: 4
+          label: root
           size_mib: 0
           resize: true
-
-  luks:
-    - name: root
-      label: luks-root
-      device: /dev/disk/by-partlabel/root
-      wipe_volume: true
-      discard: true
-      key_file:
-        local: luks.key
-@@CLEVIS_BLOCK@@
-
-  filesystems:
-    - device: /dev/mapper/root
-      format: xfs
-      wipe_filesystem: true
-      label: root
 
   directories:
     - path: /var/lib/firmware/brcm
@@ -52,9 +43,9 @@ kernel_arguments:
     - iommu=pt
     - mem_sleep_default=s2idle
     - firmware_class.path=/var/lib/firmware
+@@OPTIONAL_KERNEL_ARGUMENTS@@
 
 systemd:
   units:
     - name: t2-enablement.service
       enabled: true
-@@OPTIONAL_SYSTEMD_UNITS@@
