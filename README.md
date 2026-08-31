@@ -1,6 +1,6 @@
 # t2-coreos
 
-Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. The installed system starts from stock Fedora CoreOS and applies the t2linux kernel and packages with rpm-ostree on first boot.
+Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. Installation starts from stock Fedora CoreOS, then applies the t2linux kernel and userspace packages with rpm-ostree on first boot.
 
 ## Requirements
 
@@ -10,17 +10,24 @@ Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. The inst
 
 ## Build
 
-`--ssh-key` and `--tang-url` are required:
-
 ```bash
 ./build-iso \
     --ssh-key ~/.ssh/id_ed25519.pub \
-    --hostname t2-macbook \
-    --disk /dev/nvme0n1 \
     --tang-url http://tang-server.local:7500
 ```
 
-The installer runs automatically against the selected disk. Outputs are written under `out/`:
+Defaults:
+
+```text
+hostname: t2mac
+disk:     /dev/nvme0n1
+stream:   stable
+output:   out/
+```
+
+The generated ISO installs automatically to the configured disk and erases its existing contents. Use `--disk`, `--hostname`, or `--stream` to override the defaults.
+
+Build output includes:
 
 ```text
 out/t2-coreos-installer.iso
@@ -28,33 +35,29 @@ out/t2-fcos.bu
 out/staging/
 ```
 
-## Fedora CoreOS version selection
+Downloaded FCOS ISOs are cached by exact release version.
 
-The builder selects the newest entry in the FCOS release index whose Fedora major has an enabled x86_64 chroot in the T2 COPR. The selected version is used for the live ISO, and the helper RPM is built against the matching Fedora major.
+## Version compatibility
 
-Downloaded base ISOs are cached in `out/` by exact FCOS version.
+The builder selects the newest released FCOS version in the requested stream whose Fedora major has an enabled x86_64 chroot in `sharpenedblade/t2linux`. The helper RPM is built against that same Fedora major.
 
-## LUKS and Tang
+Installed systems keep normal Zincati update behavior through a local Cincinnati filter. The filter preserves Fedora's update graph but hides update edges targeting Fedora majors that the T2 COPR does not support. If the graph or compatibility data cannot be validated, Zincati retries later rather than updating unfiltered.
 
-Root encryption uses Butane's `boot_device.luks` support with Tang. The builder embeds the Tang advertisement and derives its signing-key thumbprint.
+Zincati uses a configured Saturday 03:00–05:00 maintenance window for update reboots.
 
-mDNS and `systemd-resolved` are included in the initramfs so `.local` Tang URLs resolve during boot. The internal T2 CDC-NCM interface is excluded from NetworkManager management.
+## Installation and first boot
 
-A recovery passphrase can be enrolled manually after installation.
+The installer configures:
 
-## T2 enablement
+- LUKS root encryption unlocked through Tang;
+- mDNS and `systemd-resolved` in the initramfs for `.local` Tang URLs;
+- the configured hostname and SSH key;
+- a large console font;
+- tty8 for the live journal and tty9 for the systemd debug shell.
 
-On first boot, `t2-enablement.service`:
+On first boot, `t2-enablement.service` installs the T2 kernel and packages, regenerates the initramfs, and reboots into the resulting deployment. Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until this completes.
 
-1. installs the FCOS dracut sysusers helper;
-2. applies the t2linux kernel override;
-3. installs the configured T2 packages;
-4. enables rpm-ostree initramfs regeneration;
-5. reboots into the T2 deployment.
-
-Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until enablement completes.
-
-Default T2 packages:
+Default T2 packages are:
 
 ```text
 t2fanrd
@@ -63,43 +66,20 @@ t2linux-audio
 systemd-resolved
 ```
 
-Repeat `--t2-package PACKAGE` to replace the defaults. `systemd-resolved` is always included.
-
-The generated initramfs force-loads:
-
-```text
-t2bce_dma
-t2bce_core
-t2bce_vhci
-```
+Repeat `--t2-package PACKAGE` to replace the default package set. `systemd-resolved` is always included.
 
 ## Lid behavior
 
-Lid closure does not suspend the machine. `t2-lid-display.service` powers down the internal display backlight while the lid is closed and restores it when opened. It ignores the Touch Bar's `appletb_backlight` device.
-
-## Console and live installer
-
-The live and installed systems use `latarcyrheb-sun32`. `rd.vconsole.font=latarcyrheb-sun32` applies the font during initramfs startup; the earliest kernel messages still use the kernel's built-in font.
-
-The live installer adds:
-
-```text
-rd.driver.blacklist=applesmc
-modprobe.blacklist=applesmc
-systemd.debug_shell=1
-```
-
-The debug shell is on tty9. The live journal follows on tty8.
+Closing the lid does not suspend the system. `t2-lid-display.service` turns off the internal display backlight while the lid is closed and restores it when opened. The Touch Bar backlight is ignored.
 
 ## Project layout
 
 ```text
-build-iso                 build entry point
-config/                   Butane templates
-files/common/             installed system files
-files/dracut/             dracut helper source
-installer/                live installer hook
-packaging/                helper RPM spec
-templates/                configuration templates
-out/staging/              rendered build inputs
+build-iso       build entry point
+config/         Butane templates
+files/common/   installed system files
+files/dracut/   dracut helper source
+installer/      live installer hook
+packaging/      helper RPM spec
+templates/      source configuration templates
 ```

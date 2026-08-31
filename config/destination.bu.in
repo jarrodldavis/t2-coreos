@@ -50,3 +50,5 @@ systemd:
       enabled: true
     - name: t2-lid-display.service
       enabled: true
+    - name: t2-cincinnati-filter.service
+      enabled: true

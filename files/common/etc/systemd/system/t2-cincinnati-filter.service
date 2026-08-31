@@ -1,0 +1,16 @@
+[Unit]
+Description=Filter Fedora CoreOS updates for T2 compatibility
+ConditionFirstBoot=no
+Before=zincati.service
+
+[Service]
+ExecStart=/usr/local/bin/t2-cincinnati-filter
+Restart=on-failure
+RestartSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
