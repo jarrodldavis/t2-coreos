@@ -1,23 +1,14 @@
 # t2-coreos
 
-Builds Fedora CoreOS ISOs for an Intel T2 MacBook Pro.
-
-Normal mode produces a self-installing ISO. `--diagnostic` produces a non-installing live ISO. The installed system starts from stock Fedora CoreOS and applies the t2linux kernel and userspace packages with rpm-ostree on first boot.
+Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. The installed system starts from stock Fedora CoreOS and applies the t2linux kernel and packages with rpm-ostree on first boot.
 
 ## Requirements
 
 - Python 3
 - Podman
-- `curl` for installer builds
+- curl
 
-The default container images are:
-
-- `quay.io/coreos/butane:release`
-- `quay.io/coreos/coreos-installer:release`
-
-Use `--native` to use local `butane` and `coreos-installer` binaries instead.
-
-## Build an installer ISO
+## Build
 
 `--ssh-key` and `--tang-url` are required:
 
@@ -29,9 +20,7 @@ Use `--native` to use local `butane` and `coreos-installer` binaries instead.
     --tang-url http://tang-server.local:7500
 ```
 
-The installer runs automatically against the selected disk.
-
-Outputs are written under `out/`, including:
+The installer runs automatically against the selected disk. Outputs are written under `out/`:
 
 ```text
 out/t2-coreos-installer.iso
@@ -39,16 +28,17 @@ out/t2-fcos.bu
 out/staging/
 ```
 
-Run `./build-iso --help` for all options.
+## Fedora CoreOS version selection
+
+The builder selects the newest entry in the FCOS release index whose Fedora major has an enabled x86_64 chroot in the T2 COPR. The selected version is used for the live ISO, and the helper RPM is built against the matching Fedora major.
+
+Downloaded base ISOs are cached in `out/` by exact FCOS version.
 
 ## LUKS and Tang
 
-Root encryption uses Butane's native `boot_device.luks` configuration with Tang. Ignition resizes the root partition to fill the disk during provisioning.
+Root encryption uses Butane's `boot_device.luks` support with Tang. The builder embeds the Tang advertisement and derives its signing-key thumbprint.
 
-The builder embeds the Tang advertisement for offline provisioning. If `--tang-thumbprint` is omitted, it derives the signing-key thumbprint from the advertisement.
-
-`.local` Tang URLs enable the mDNS configuration automatically. Override this with `--tang-mdns=on` or `--tang-mdns=off`.
-mDNS Tang boots enable initramfs DHCP networking automatically. The internal T2 CDC-NCM interface is marked as non-NetworkManager-owned so it does not participate in DHCP or wait-online.
+mDNS and `systemd-resolved` are included in the initramfs so `.local` Tang URLs resolve during boot. The internal T2 CDC-NCM interface is excluded from NetworkManager management.
 
 A recovery passphrase can be enrolled manually after installation.
 
@@ -56,15 +46,13 @@ A recovery passphrase can be enrolled manually after installation.
 
 On first boot, `t2-enablement.service`:
 
-1. configures the `sharpenedblade/t2linux` repository;
-2. applies a persistent kernel override;
-3. layers the configured T2 packages;
-4. layers the FCOS dracut sysusers helper when mDNS Tang support is enabled;
-5. enables rpm-ostree initramfs regeneration.
+1. installs the FCOS dracut sysusers helper;
+2. applies the t2linux kernel override;
+3. installs the configured T2 packages;
+4. enables rpm-ostree initramfs regeneration;
+5. reboots into the T2 deployment.
 
-The service reboots into the T2 deployment after successful enablement.
-
-User logins are held until first-boot T2 enablement succeeds and triggers a reboot.
+Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until enablement completes.
 
 Default T2 packages:
 
@@ -72,9 +60,10 @@ Default T2 packages:
 t2fanrd
 tiny-dfr
 t2linux-audio
+systemd-resolved
 ```
 
-Repeat `--t2-package PACKAGE` to replace the default set.
+Repeat `--t2-package PACKAGE` to replace the defaults. `systemd-resolved` is always included.
 
 The generated initramfs force-loads:
 
@@ -84,59 +73,33 @@ t2bce_core
 t2bce_vhci
 ```
 
-When mDNS Tang support is enabled, `systemd-resolved` is also layered and included in the initramfs configuration.
+## Lid behavior
 
-## Live installer settings
+Lid closure does not suspend the machine. `t2-lid-display.service` powers down the internal display backlight while the lid is closed and restores it when opened. It ignores the Touch Bar's `appletb_backlight` device.
 
-The installer live environment adds:
+## Console and live installer
+
+The live and installed systems use `latarcyrheb-sun32`. `rd.vconsole.font=latarcyrheb-sun32` applies the font during initramfs startup; the earliest kernel messages still use the kernel's built-in font.
+
+The live installer adds:
 
 ```text
 rd.driver.blacklist=applesmc
 modprobe.blacklist=applesmc
+systemd.debug_shell=1
 ```
 
-This prevents the stock `applesmc` driver from blocking udev on T2 hardware. The blacklist is not added to the installed system.
-
-The systemd debug shell is available on tty9.
-
-## Diagnostic ISO
-
-Build a non-installing live ISO with SSH access:
-
-```bash
-./build-iso \
-    --diagnostic \
-    --ssh-key ~/.ssh/id_ed25519.pub
-```
-
-Output:
-
-```text
-out/t2-coreos-diagnostic.iso
-```
-
-Tang is not required in diagnostic mode. The default hostname is `t2-coreos-live`, SSH is enabled for `core`, and the systemd debug shell is available on tty9.
-
-Add live kernel arguments with repeated `--live-karg` options:
-
-```bash
-./build-iso \
-    --diagnostic \
-    --ssh-key ~/.ssh/id_ed25519.pub \
-    --live-karg rd.udev.log_level=debug \
-    --live-karg udev.log_level=debug
-```
-
-`--diagnostic-console-log` follows the journal on tty8.
+The debug shell is on tty9. The live journal follows on tty8.
 
 ## Project layout
 
 ```text
 build-iso                 build entry point
-config/                   Butane templates and fragments
-files/common/             files installed on every system
-files/mdns/               files used for mDNS Tang support
+config/                   Butane templates
+files/common/             installed system files
+files/dracut/             dracut helper source
 installer/                live installer hook
-templates/                generated configuration templates
+packaging/                helper RPM spec
+templates/                configuration templates
 out/staging/              rendered build inputs
 ```

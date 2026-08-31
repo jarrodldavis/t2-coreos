@@ -5,10 +5,13 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parent
 
@@ -16,11 +19,38 @@ COPR_OWNER = "sharpenedblade"
 COPR_PROJECT = "t2linux"
 COPR_BASE = f"https://download.copr.fedorainfracloud.org/results/{COPR_OWNER}/{COPR_PROJECT}"
 COPR_REPO = f"copr:copr.fedorainfracloud.org:{COPR_OWNER}:{COPR_PROJECT}"
-
+COPR_API = "https://copr.fedorainfracloud.org/api_3/project"
+FCOS_BUILD_BASE = "https://builds.coreos.fedoraproject.org/prod/streams"
 BUTANE_IMG = "quay.io/coreos/butane:release"
 INSTALLER_IMG = "quay.io/coreos/coreos-installer:release"
-RPMBUILD_IMG = "registry.fedoraproject.org/fedora:44"
-DEFAULT_T2_PACKAGES = ["t2fanrd", "tiny-dfr", "t2linux-audio"]
+DEFAULT_T2_PACKAGES = ["t2fanrd", "tiny-dfr", "t2linux-audio", "systemd-resolved"]
+
+
+@dataclass(frozen=True)
+class FcosRelease:
+    version: str
+    fedora_major: int
+    stream: str
+
+    @property
+    def iso_url(self) -> str:
+        filename = f"fedora-coreos-{self.version}-live-iso.x86_64.iso"
+        return f"{FCOS_BUILD_BASE}/{self.stream}/builds/{self.version}/x86_64/{filename}"
+
+
+@dataclass(frozen=True)
+class BuildPaths:
+    out_setting: Path
+    out_dir: Path
+    staging: Path
+
+    @property
+    def stage_arg(self) -> str:
+        return "/out/staging"
+
+    @property
+    def out_arg(self) -> str:
+        return "/out"
 
 
 def log(message: str) -> None:
@@ -32,9 +62,9 @@ def die(message: str) -> None:
     raise SystemExit(1)
 
 
-def require_command(command: str, message: str) -> None:
+def require_command(command: str) -> None:
     if shutil.which(command) is None:
-        die(message)
+        die(f"{command} not found")
 
 
 def render(path: Path, replacements: dict[str, str]) -> str:
@@ -62,52 +92,89 @@ def read_ssh_key(value: str) -> str:
     return key
 
 
-def write_enablement_config(path: Path, t2_packages: list[str], tang_mdns: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    packages = " ".join(t2_packages)
-    path.write_text(
-        f"COPR_REPO={json.dumps(COPR_REPO)}\n"
-        f"T2_PKGS={json.dumps(packages)}\n"
-        f"TANG_MDNS={1 if tang_mdns else 0}\n"
-    )
-
-
-def build_dracut_rpm(staging: Path, *, native: bool) -> Path:
-    topdir = staging / "rpmbuild"
-    sources = topdir / "SOURCES"
-    specs = topdir / "SPECS"
-    sources.mkdir(parents=True)
-    specs.mkdir(parents=True)
-
-    shutil.copyfile(ROOT / "files/dracut/50coreos-sysusers/module-setup.sh", sources / "module-setup.sh")
-    spec = specs / "t2-coreos-dracut.spec"
-    shutil.copyfile(ROOT / "packaging/t2-coreos-dracut.spec", spec)
-
-    if native:
-        require_command("rpmbuild", "rpmbuild not found (omit --native to build the helper RPM with Podman)")
-        subprocess.run(["rpmbuild", "--define", f"_topdir {topdir}", "-bb", str(spec)], check=True)
-    else:
-        subprocess.run(
-            [
-                "podman", "run", "--rm", "--security-opt", "label=disable",
-                "-v", f"{topdir}:/work:z", "-w", "/work", RPMBUILD_IMG,
-                "bash", "-lc",
-                "dnf -qy install rpm-build && rpmbuild --define '_topdir /work' -bb SPECS/t2-coreos-dracut.spec",
-            ],
-            check=True,
-        )
-
-    rpms = list((topdir / "RPMS/noarch").glob("t2-coreos-dracut-*.noarch.rpm"))
-    if len(rpms) != 1:
-        die("did not produce exactly one t2-coreos-dracut helper RPM")
-    return rpms[0]
-
-
-def fetch(url: str) -> bytes:
-    result = subprocess.run(["curl", "-fsSL", url], check=False, stdout=subprocess.PIPE)
+def fetch(url: str, headers: dict[str, str] | None = None) -> bytes:
+    command = ["curl", "-fsSL"]
+    for name, value in (headers or {}).items():
+        command.extend(["-H", f"{name}: {value}"])
+    command.append(url)
+    result = subprocess.run(command, check=False, stdout=subprocess.PIPE)
     if result.returncode != 0:
         die(f"could not fetch {url}")
     return result.stdout
+
+
+def fetch_json(url: str, headers: dict[str, str] | None = None) -> object:
+    try:
+        return json.loads(fetch(url, headers))
+    except json.JSONDecodeError as error:
+        die(f"invalid JSON from {url}: {error}")
+
+
+def collect_matching_strings(value: object, pattern: re.Pattern[str]) -> set[str]:
+    matches: set[str] = set()
+
+    if isinstance(value, str):
+        matches.update(match.group(0) for match in pattern.finditer(value))
+    elif isinstance(value, list):
+        for item in value:
+            matches.update(collect_matching_strings(item, pattern))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            matches.update(collect_matching_strings(key, pattern))
+            matches.update(collect_matching_strings(item, pattern))
+
+    return matches
+
+
+def get_copr_fedora_majors() -> set[int]:
+    query = urlencode({"ownername": COPR_OWNER, "projectname": COPR_PROJECT})
+    project = fetch_json(f"{COPR_API}?{query}")
+    if not isinstance(project, dict):
+        die("COPR project API returned an unexpected response")
+
+    pattern = re.compile(r"fedora-(\d+)-x86_64")
+    declared = {
+        int(match.split("-", 2)[1])
+        for field in ("chroots", "chroot_repos")
+        for match in collect_matching_strings(project.get(field), pattern)
+    }
+    if not declared:
+        die(f"COPR {COPR_OWNER}/{COPR_PROJECT} declares no Fedora x86_64 chroots")
+    return declared
+
+
+def fcos_fedora_major(version: str) -> int:
+    major, separator, _ = version.partition(".")
+    if not separator or not major.isdigit():
+        die(f"unexpected Fedora CoreOS version: {version!r}")
+    return int(major)
+
+
+def get_fcos_releases(stream: str) -> list[str]:
+    index = fetch_json(f"{FCOS_BUILD_BASE}/{stream}/releases.json")
+    if not isinstance(index, dict) or index.get("stream") != stream:
+        die("Fedora CoreOS release index returned an unexpected response")
+
+    releases = index.get("releases")
+    if not isinstance(releases, list) or not releases:
+        die(f"Fedora CoreOS {stream} release index contains no releases")
+
+    versions = []
+    for release in releases:
+        if not isinstance(release, dict) or not isinstance(release.get("version"), str):
+            die("Fedora CoreOS release index contains an invalid release entry")
+        versions.append(release["version"])
+    return versions
+
+
+def select_fcos_release(stream: str, supported_majors: set[int]) -> FcosRelease:
+    for version in reversed(get_fcos_releases(stream)):
+        fedora_major = fcos_fedora_major(version)
+        if fedora_major in supported_majors:
+            return FcosRelease(version, fedora_major, stream)
+
+    majors = ", ".join(str(major) for major in sorted(supported_majors))
+    die(f"no Fedora CoreOS {stream} release matches T2 COPR Fedora chroots: {majors}")
 
 
 def decode_base64url(value: str) -> bytes:
@@ -115,12 +182,12 @@ def decode_base64url(value: str) -> bytes:
 
 
 def jwk_thumbprint(jwk: dict[str, object]) -> str:
-    kty = jwk.get("kty")
     members_by_type = {
         "EC": ("crv", "kty", "x", "y"),
         "OKP": ("crv", "kty", "x"),
         "RSA": ("e", "kty", "n"),
     }
+    kty = jwk.get("kty")
     members = members_by_type.get(kty)
     if members is None or any(name not in jwk for name in members):
         die(f"unsupported Tang signing-key type: {kty!r}")
@@ -130,7 +197,7 @@ def jwk_thumbprint(jwk: dict[str, object]) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
-def fetch_tang_advertisement(url: str) -> tuple[str, list[str]]:
+def fetch_tang_advertisement(url: str) -> tuple[str, str]:
     advertisement_url = f"{url.rstrip('/')}/adv"
     try:
         advertisement = json.loads(fetch(advertisement_url))
@@ -150,22 +217,20 @@ def fetch_tang_advertisement(url: str) -> tuple[str, list[str]]:
         die(f"Tang advertisement from {advertisement_url} contains no signing keys")
 
     thumbprints = sorted({jwk_thumbprint(key) for key in signing_keys})
-    return json.dumps(advertisement, separators=(",", ":")), thumbprints
+    if len(thumbprints) != 1:
+        die(f"Tang advertisement from {advertisement_url} contains {len(thumbprints)} signing keys; cannot choose automatically")
+
+    return json.dumps(advertisement, separators=(",", ":")), thumbprints[0]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Fedora CoreOS installer or diagnostic live ISOs for an Intel T2 Mac")
+    parser = argparse.ArgumentParser(description="Build a self-installing Fedora CoreOS ISO for an Intel T2 Mac")
     parser.add_argument("--ssh-key", required=True, help="public key file or literal public key")
-    parser.add_argument("--diagnostic", action="store_true", help="build a non-installing diagnostic live ISO")
+    parser.add_argument("--tang-url", required=True, help="Tang server URL")
     parser.add_argument("--disk", default="/dev/nvme0n1", help="automatic installation target")
     parser.add_argument("--stream", choices=("stable", "testing", "next"), default="stable", help="Fedora CoreOS stream")
-    parser.add_argument("--hostname", help="hostname; defaults to t2mac or t2-coreos-live in diagnostic mode")
+    parser.add_argument("--hostname", default="t2mac", help="installed hostname")
     parser.add_argument("--out-dir", type=Path, default=Path("out"), help="build and staging directory")
-
-    parser.add_argument("--tang-url", help="Tang server URL (required for installer builds)")
-    parser.add_argument("--tang-thumbprint", help="trusted Tang signing-key thumbprint; auto-discovered if omitted")
-    parser.add_argument("--tang-mdns", choices=("auto", "on", "off"), default="auto")
-
     parser.add_argument(
         "--t2-package",
         action="append",
@@ -174,272 +239,228 @@ def parse_args() -> argparse.Namespace:
         help="T2 userspace package to layer; repeat to replace the default package set",
     )
     parser.add_argument("--live-karg", action="append", default=[], metavar="ARG", help="extra live-environment kernel argument")
-    parser.add_argument("--live-debug-shell", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--diagnostic-console-log",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="follow the live journal on tty8 in diagnostic mode",
-    )
-    parser.add_argument("--copr-gpg-key", type=Path, help="local t2linux COPR public key")
-    parser.add_argument("--native", action="store_true", help="use native Butane/coreos-installer instead of Podman")
     return parser.parse_args()
 
-def main() -> None:
-    args = parse_args()
-    hostname = args.hostname or ("t2-coreos-live" if args.diagnostic else "t2mac")
 
-    if args.diagnostic_console_log and not args.diagnostic:
-        die("--diagnostic-console-log requires --diagnostic")
-    if not args.diagnostic and not args.tang_url:
-        die("--tang-url is required for installer builds")
-    if args.tang_thumbprint and not args.tang_url:
-        die("--tang-thumbprint requires --tang-url")
-
-    if not args.diagnostic:
-        require_command("curl", "curl not found")
-    if args.native:
-        require_command("butane", "butane not found (omit --native to use Podman)")
-        require_command("coreos-installer", "coreos-installer not found")
-    else:
-        require_command("podman", "podman not found (or use --native)")
-
-    ssh_key = read_ssh_key(args.ssh_key)
-    out_setting = args.out_dir.expanduser()
+def prepare_paths(out_setting: Path) -> BuildPaths:
+    out_setting = out_setting.expanduser()
     out_setting.mkdir(parents=True, exist_ok=True)
     out_dir = out_setting.resolve()
     staging = out_dir / "staging"
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(mode=0o700)
+    return BuildPaths(out_setting, out_dir, staging)
 
-    if args.native:
-        stage_arg = str(staging)
-        out_arg = str(out_dir)
 
-        def run_butane(command_args: list[str], *, stdout=None) -> None:
-            subprocess.run(["butane", *command_args], check=True, stdout=stdout)
+def run_container(
+    paths: BuildPaths, image: str, command: list[str], *, stdout=None, pull: bool = False
+) -> subprocess.CompletedProcess:
+    args = ["podman", "run", "--rm"]
+    args += ["--security-opt", "label=disable"]
+    if pull:
+        args.append("--pull=always")
+    args += ["-v", f"{paths.out_dir}:/out:z", "-w", paths.stage_arg, image, *command]
+    return subprocess.run(args, check=True, stdout=stdout)
 
-        def run_installer(command_args: list[str], *, stdout=None) -> None:
-            subprocess.run(["coreos-installer", *command_args], check=True, stdout=stdout)
-    else:
-        stage_arg = "/out/staging"
-        out_arg = "/out"
 
-        def run_butane(command_args: list[str], *, stdout=None) -> None:
-            subprocess.run(
-                [
-                    "podman", "run", "--rm", "-i", "--security-opt", "label=disable",
-                    "-v", f"{out_dir}:/out:z", "-w", stage_arg, BUTANE_IMG, *command_args,
-                ],
-                check=True,
-                stdout=stdout,
-            )
+def run_butane(paths: BuildPaths, command: list[str], *, stdout=None) -> None:
+    run_container(paths, BUTANE_IMG, command, stdout=stdout)
 
-        def run_installer(command_args: list[str], *, stdout=None) -> None:
-            subprocess.run(
-                [
-                    "podman", "run", "--rm", "-i", "--security-opt", "label=disable", "--pull=always",
-                    "-v", f"{out_dir}:/out:z", "-w", stage_arg, INSTALLER_IMG, *command_args,
-                ],
-                check=True,
-                stdout=stdout,
-            )
 
-    log(f"Downloading Fedora CoreOS {args.stream} live ISO")
-    run_installer(["download", "-s", args.stream, "-p", "metal", "-f", "iso", "-C", out_arg])
+def run_installer(paths: BuildPaths, command: list[str], *, stdout=None) -> None:
+    run_container(paths, INSTALLER_IMG, command, stdout=stdout, pull=True)
 
-    images = list(out_dir.glob("fedora-coreos-*-live*.iso"))
-    if not images:
-        die("coreos-installer download did not produce a live ISO")
-    base_iso = max(images, key=lambda path: path.stat().st_mtime)
-    log(f"Base image: {base_iso.name}")
 
-    if args.diagnostic:
-        console_unit = ""
-        if args.diagnostic_console_log:
-            console_unit = (ROOT / "config/fragments/diagnostic-console-log.bu").read_text().rstrip()
+def download_base_iso(paths: BuildPaths, release: FcosRelease) -> Path:
+    filename = Path(release.iso_url).name
+    base_iso = paths.out_dir / filename
 
-        rendered_butane = render(
-            ROOT / "config/diagnostic.bu.in",
-            {
-                "SSH_KEY": json.dumps(ssh_key),
-                "HOSTNAME": json.dumps(hostname),
-                "OPTIONAL_SYSTEMD_UNITS": console_unit,
-            },
-        )
-        butane_path = staging / "diagnostic.bu"
-        ignition_path = staging / "diagnostic.ign"
-        butane_path.write_text(rendered_butane)
+    if base_iso.is_file():
+        log(f"Using cached Fedora CoreOS ISO: {base_iso.name}")
+        return base_iso
 
-        log("Transpiling diagnostic Butane -> Ignition")
-        with ignition_path.open("wb") as output:
-            run_butane(["--strict", f"{stage_arg}/diagnostic.bu"], stdout=output)
-        if ignition_path.stat().st_size == 0:
-            die("butane produced an empty diagnostic config")
+    log(f"Downloading Fedora CoreOS ISO: {base_iso.name}")
+    run_installer(paths, ["download", "--image-url", release.iso_url, "-C", paths.out_arg])
+    if not base_iso.is_file():
+        die(f"coreos-installer download did not produce {filename}")
 
-        output_iso = out_dir / "t2-coreos-diagnostic.iso"
-        output_iso.unlink(missing_ok=True)
-        customize_args = [
-            "iso", "customize",
-            "--live-ignition", f"{stage_arg}/diagnostic.ign",
-            "-o", f"{out_arg}/{output_iso.name}",
-        ]
-        for karg in args.live_karg:
-            customize_args += ["--live-karg-append", karg]
-        if args.live_debug_shell:
-            customize_args += ["--live-karg-append", "systemd.debug_shell=1"]
-        customize_args.append(f"{out_arg}/{base_iso.name}")
+    return base_iso
 
-        log("Building diagnostic live ISO")
-        run_installer(customize_args)
 
-        print()
-        log("Done")
-        print()
-        print(f"  ISO:    {out_setting / output_iso.name}")
-        print(f"  Stage:  {out_setting / 'staging'}")
-        print(f"  Host:   {hostname}")
-        print("  Install: disabled")
-        print()
-        print(f"Write it with:  sudo dd if={out_setting / output_iso.name} of=/dev/diskN bs=4M status=progress oflag=direct")
-        return
+def build_dracut_rpm(paths: BuildPaths, fedora_major: int) -> Path:
+    topdir = paths.staging / "rpmbuild"
+    sources = topdir / "SOURCES"
+    specs = topdir / "SPECS"
+    sources.mkdir(parents=True)
+    specs.mkdir(parents=True)
 
-    tang_mdns = args.tang_mdns == "on" or (args.tang_mdns == "auto" and ".local" in args.tang_url)
+    shutil.copyfile(ROOT / "files/dracut/50coreos-sysusers/module-setup.sh", sources / "module-setup.sh")
+    shutil.copyfile(ROOT / "packaging/t2-coreos-dracut.spec", specs / "t2-coreos-dracut.spec")
 
-    t2_packages = list(args.t2_packages or DEFAULT_T2_PACKAGES)
-    if tang_mdns and "systemd-resolved" not in t2_packages:
-        t2_packages.append("systemd-resolved")
+    run_container(
+        paths,
+        f"registry.fedoraproject.org/fedora:{fedora_major}",
+        [
+            "bash",
+            "-lc",
+            "dnf -qy install rpm-build && "
+            "rpmbuild --define '_topdir /out/staging/rpmbuild' -bb /out/staging/rpmbuild/SPECS/t2-coreos-dracut.spec",
+        ],
+    )
 
-    log(f"Fetching Tang advertisement from {args.tang_url}")
-    tang_advertisement, thumbprints = fetch_tang_advertisement(args.tang_url)
-    tang_thumbprint = args.tang_thumbprint
-    if tang_thumbprint:
-        if tang_thumbprint not in thumbprints:
-            die("--tang-thumbprint does not match a signing key in the Tang advertisement")
-    else:
-        tang_thumbprint = thumbprints[0]
-        log(f"Tang signing-key thumbprint (trust on first use): {tang_thumbprint}")
-        if len(thumbprints) > 1:
-            log(f"Advertisement contains {len(thumbprints)} signing keys; using the first thumbprint")
+    rpms = list((topdir / "RPMS/noarch").glob("t2-coreos-dracut-*.noarch.rpm"))
+    if len(rpms) != 1:
+        die("did not produce exactly one t2-coreos-dracut helper RPM")
+    return rpms[0]
 
-    files_dir = staging / "files"
-    rootfs = files_dir / "rootfs"
+
+def write_enablement_config(path: Path, t2_packages: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"COPR_REPO={json.dumps(COPR_REPO)}\nT2_PKGS={json.dumps(' '.join(t2_packages))}\n")
+
+
+def prepare_rootfs(paths: BuildPaths, hostname: str, t2_packages: list[str], release: FcosRelease) -> Path:
+    rootfs = paths.staging / "files/rootfs"
     rootfs.mkdir(parents=True)
-    os.chmod(files_dir, 0o700)
-
+    os.chmod(paths.staging / "files", 0o700)
     copy_tree(ROOT / "files/common", rootfs)
-    if tang_mdns:
-        copy_tree(ROOT / "files/mdns", rootfs)
 
-    (rootfs / "etc").mkdir(parents=True, exist_ok=True)
     (rootfs / "etc/hostname").write_text(f"{hostname}\n")
 
     repo_path = rootfs / "etc/yum.repos.d/t2linux.repo"
     repo_path.parent.mkdir(parents=True, exist_ok=True)
-    repo_path.write_text(
-        render(
-            ROOT / "templates/t2linux.repo.in",
-            {
-                "COPR_OWNER": COPR_OWNER,
-                "COPR_PROJECT": COPR_PROJECT,
-                "COPR_BASE": COPR_BASE,
-            },
-        )
-    )
+    repo_path.write_text(render(ROOT / "templates/t2linux.repo.in", {"COPR_OWNER": COPR_OWNER, "COPR_PROJECT": COPR_PROJECT, "COPR_BASE": COPR_BASE}))
 
-    write_enablement_config(rootfs / "etc/t2-coreos/t2-enablement.conf", t2_packages, tang_mdns)
+    write_enablement_config(rootfs / "etc/t2-coreos/t2-enablement.conf", t2_packages)
 
-    if tang_mdns:
-        log("Building Fedora CoreOS dracut sysusers helper RPM")
-        helper_rpm = build_dracut_rpm(staging, native=args.native)
-        helper_target = rootfs / "etc/t2-coreos/t2-coreos-dracut.rpm"
-        helper_target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(helper_rpm, helper_target)
+    log("Building dracut helper RPM")
+    helper_rpm = build_dracut_rpm(paths, release.fedora_major)
+    helper_target = rootfs / "etc/t2-coreos/t2-coreos-dracut.rpm"
+    helper_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(helper_rpm, helper_target)
 
     gpg_path = rootfs / "etc/pki/rpm-gpg/RPM-GPG-KEY-t2linux"
     gpg_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.copr_gpg_key:
-        gpg_source = args.copr_gpg_key.expanduser()
-        log(f"Using COPR signing key from {gpg_source}")
-        shutil.copyfile(gpg_source, gpg_path)
-    else:
-        log("Fetching t2linux COPR signing key")
-        gpg_path.write_bytes(fetch(f"{COPR_BASE}/pubkey.gpg"))
-
+    gpg_path.write_bytes(fetch(f"{COPR_BASE}/pubkey.gpg"))
     if "BEGIN PGP PUBLIC KEY" not in gpg_path.read_text(errors="replace"):
         die("COPR key file does not look like an ASCII-armored PGP key")
 
-    storage_files = []
+    return rootfs
 
-    rendered_butane = render(
+
+def transpile_butane(paths: BuildPaths, template: Path, output_name: str, replacements: dict[str, str], *, files_dir: bool = False) -> Path:
+    bu_path = paths.staging / f"{output_name}.bu"
+    ign_path = paths.staging / f"{output_name}.ign"
+    bu_path.write_text(render(template, replacements))
+
+    command = ["--strict"]
+    if files_dir:
+        command += ["--files-dir", f"{paths.stage_arg}/files"]
+    command.append(f"{paths.stage_arg}/{bu_path.name}")
+
+    with ign_path.open("wb") as output:
+        run_butane(paths, command, stdout=output)
+    if ign_path.stat().st_size == 0:
+        die(f"butane produced an empty {output_name} config")
+    return ign_path
+
+
+def build_configs(paths: BuildPaths, ssh_key: str, tang_url: str, tang_advertisement: str, tang_thumbprint: str) -> tuple[Path, Path]:
+    destination_ign = transpile_butane(
+        paths,
         ROOT / "config/destination.bu.in",
+        "config",
         {
             "SSH_KEY": json.dumps(ssh_key),
-            "TANG_URL": json.dumps(args.tang_url),
+            "TANG_URL": json.dumps(tang_url),
             "TANG_THUMBPRINT": json.dumps(tang_thumbprint),
             "TANG_ADVERTISEMENT": json.dumps(tang_advertisement),
-            "OPTIONAL_STORAGE_FILES": "\n".join(storage_files),
-            "OPTIONAL_KERNEL_ARGUMENTS": (
-                "    - rd.neednet=1\n"
-                "    - ip=dhcp\n"
-                "    - rd.net.dns-backend=systemd-resolved"
-                if tang_mdns
-                else ""
-            ),
         },
+        files_dir=True,
     )
+    shutil.copyfile(paths.staging / "config.bu", paths.out_dir / "t2-fcos.bu")
 
-    butane_output = out_dir / "t2-fcos.bu"
-    butane_output.write_text(rendered_butane)
-    config_bu = staging / "config.bu"
-    config_bu.write_text(rendered_butane)
+    live_ign = transpile_butane(
+        paths,
+        ROOT / "config/live.bu.in",
+        "live",
+        {"SSH_KEY": json.dumps(ssh_key)},
+    )
+    return destination_ign, live_ign
 
-    pre_install = render(ROOT / "installer/pre-install.sh.in", {"DISK": args.disk})
-    pre_install_path = staging / "pre-install.sh"
-    pre_install_path.write_text(pre_install)
+
+def build_installer_iso(paths: BuildPaths, base_iso: Path, disk: str, destination_ign: Path, live_ign: Path, live_kargs: list[str]) -> Path:
+    pre_install_path = paths.staging / "pre-install.sh"
+    pre_install_path.write_text(render(ROOT / "installer/pre-install.sh.in", {"DISK": disk}))
     os.chmod(pre_install_path, 0o755)
 
-    ignition_path = staging / "config.ign"
-    log("Transpiling destination Butane -> Ignition")
-    with ignition_path.open("wb") as output:
-        run_butane(["--strict", "--files-dir", f"{stage_arg}/files", f"{stage_arg}/config.bu"], stdout=output)
-    if ignition_path.stat().st_size == 0:
-        die("butane produced an empty destination config")
-
-    output_iso = out_dir / "t2-coreos-installer.iso"
+    output_iso = paths.out_dir / "t2-coreos-installer.iso"
     output_iso.unlink(missing_ok=True)
     customize_args = [
         "iso", "customize",
-        "--dest-ignition", f"{stage_arg}/config.ign",
-        "--dest-device", args.disk,
-        "--pre-install", f"{stage_arg}/pre-install.sh",
+        "--live-ignition", f"{paths.stage_arg}/{live_ign.name}",
+        "--dest-ignition", f"{paths.stage_arg}/{destination_ign.name}",
+        "--dest-device", disk,
+        "--pre-install", f"{paths.stage_arg}/pre-install.sh",
         "--live-karg-append", "rd.driver.blacklist=applesmc",
         "--live-karg-append", "modprobe.blacklist=applesmc",
-        "-o", f"{out_arg}/{output_iso.name}",
+        "--live-karg-append", "console=tty1",
+        "--live-karg-append", "rd.vconsole.font=latarcyrheb-sun32",
+        "--live-karg-append", "systemd.debug_shell=1",
+        "--dest-karg-append", "console=tty1",
+        "--dest-karg-append", "rd.vconsole.font=latarcyrheb-sun32",
+        "-o", f"{paths.out_arg}/{output_iso.name}",
     ]
-    for karg in args.live_karg:
+    for karg in live_kargs:
         customize_args += ["--live-karg-append", karg]
-    if args.live_debug_shell:
-        customize_args += ["--live-karg-append", "systemd.debug_shell=1"]
-    customize_args.append(f"{out_arg}/{base_iso.name}")
+    customize_args.append(f"{paths.out_arg}/{base_iso.name}")
 
-    log(f"Building self-installing ISO (target: {args.disk})")
-    run_installer(customize_args)
+    log("Building self-installing ISO")
+    run_installer(paths, customize_args)
+    return output_iso
 
+
+def print_summary(
+    paths: BuildPaths, output_iso: Path, release: FcosRelease, disk: str, tang_url: str, tang_thumbprint: str
+) -> None:
     print()
-    log("Done")
+    print(f"  ISO:    {paths.out_setting / output_iso.name}")
+    print(f"  Config: {paths.out_setting / 't2-fcos.bu'}")
+    print(f"  Stage:  {paths.out_setting / 'staging'}")
+    print(f"  FCOS:   {release.version} (Fedora {release.fedora_major})")
+    print(f"  Target: {disk}      -- WILL BE ERASED WITHOUT PROMPTING")
+    print(f"  LUKS:   Tang at {tang_url} (mDNS resolver in initramfs)")
+    print(f"  Tang:   {tang_thumbprint}")
     print()
-    print(f"  ISO:    {out_setting / output_iso.name}")
-    print(f"  Config: {out_setting / 't2-fcos.bu'}")
-    print(f"  Stage:  {out_setting / 'staging'}")
-    print(f"  Target: {args.disk}      -- WILL BE ERASED WITHOUT PROMPTING")
-    luks_summary = f"Tang at {args.tang_url}"
-    if tang_mdns:
-        luks_summary += " (mDNS resolver in initramfs)"
-    print(f"  LUKS:   {luks_summary}")
-    print()
-    print(f"Write it with:  sudo dd if={out_setting / output_iso.name} of=/dev/diskN bs=4M status=progress oflag=direct")
+    print(f"Write it with:  sudo dd if={paths.out_setting / output_iso.name} of=/dev/diskN bs=4M status=progress oflag=direct")
+
+
+def main() -> None:
+    args = parse_args()
+    require_command("podman")
+    require_command("curl")
+
+    paths = prepare_paths(args.out_dir)
+    ssh_key = read_ssh_key(args.ssh_key)
+    t2_packages = list(args.t2_packages or DEFAULT_T2_PACKAGES)
+    if "systemd-resolved" not in t2_packages:
+        t2_packages.append("systemd-resolved")
+
+    log("Fetching Tang advertisement")
+    tang_advertisement, tang_thumbprint = fetch_tang_advertisement(args.tang_url)
+
+    supported_majors = get_copr_fedora_majors()
+    release = select_fcos_release(args.stream, supported_majors)
+    log(f"Using Fedora CoreOS {release.version} (Fedora {release.fedora_major})")
+
+    base_iso = download_base_iso(paths, release)
+    prepare_rootfs(paths, args.hostname, t2_packages, release)
+
+    destination_ign, live_ign = build_configs(paths, ssh_key, args.tang_url, tang_advertisement, tang_thumbprint)
+    output_iso = build_installer_iso(paths, base_iso, args.disk, destination_ign, live_ign, args.live_karg)
+    print_summary(paths, output_iso, release, args.disk, args.tang_url, tang_thumbprint)
+
 
 if __name__ == "__main__":
     main()

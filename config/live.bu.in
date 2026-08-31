@@ -1,9 +1,29 @@
-    - name: diagnostic-journal.service
+variant: fcos
+version: 1.7.0
+
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys:
+        - @@SSH_KEY@@
+
+storage:
+  files:
+    - path: /etc/vconsole.conf
+      mode: 0644
+      contents:
+        inline: |
+          FONT=latarcyrheb-sun32
+
+systemd:
+  units:
+    - name: live-journal.service
       enabled: true
       contents: |
         [Unit]
         Description=Follow the live journal on tty8
         After=systemd-journald.service
+        Before=coreos-installer.service
 
         [Service]
         ExecStart=/usr/bin/journalctl -b -f -o short-monotonic
@@ -16,4 +36,4 @@
         Restart=always
 
         [Install]
-        WantedBy=multi-user.target
+        RequiredBy=coreos-installer.service

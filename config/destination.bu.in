@@ -32,20 +32,21 @@ storage:
     - local: rootfs
       path: /
 
-  files:
-    - path: /etc/hostname
-      mode: 0644
-@@OPTIONAL_STORAGE_FILES@@
-
 kernel_arguments:
   should_exist:
+    - console=tty1
+    - rd.vconsole.font=latarcyrheb-sun32
     - intel_iommu=on
     - iommu=pt
     - mem_sleep_default=s2idle
     - firmware_class.path=/var/lib/firmware
-@@OPTIONAL_KERNEL_ARGUMENTS@@
+    - rd.neednet=1
+    - ip=dhcp
+    - rd.net.dns-backend=systemd-resolved
 
 systemd:
   units:
     - name: t2-enablement.service
+      enabled: true
+    - name: t2-lid-display.service
       enabled: true

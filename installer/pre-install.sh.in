@@ -4,7 +4,7 @@ set -u
 DEV="@@DISK@@"
 
 if ! udevadm wait --timeout=30 "$DEV"; then
-    echo "pre-install: $DEV never became ready; leaving it to the installer" >&2
+    echo "pre-install: $DEV not ready after 30s" >&2
     exit 0
 fi
 
@@ -16,7 +16,5 @@ while read -r swap; do
     swapoff "$swap" 2>/dev/null || true
 done < <(lsblk -nrpo NAME,FSTYPE "$DEV" | awk '$2 == "swap" { print $1 }')
 
-# Prevent udev from probing the disk while wipefs removes stale signatures.
+# Stop udev probing while wipefs runs.
 udevadm lock --device="$DEV" wipefs -a "$DEV" 2>/dev/null || wipefs -a "$DEV" 2>/dev/null || true
-
-echo "pre-install: $DEV released"

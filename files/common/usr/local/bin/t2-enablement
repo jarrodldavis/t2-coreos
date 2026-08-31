@@ -5,9 +5,7 @@ source /etc/t2-coreos/t2-enablement.conf
 
 systemctl stop zincati.service || true
 
-if [[ "$TANG_MDNS" == 1 ]]; then
-    rpm-ostree install -y /etc/t2-coreos/t2-coreos-dracut.rpm
-fi
+rpm-ostree install -y /etc/t2-coreos/t2-coreos-dracut.rpm
 
 rpm-ostree override replace \
     --experimental \
@@ -19,10 +17,6 @@ if ((${#packages[@]})); then
     rpm-ostree install -y "${packages[@]}"
 fi
 
-initramfs_args=(--enable)
-if [[ "$TANG_MDNS" == 1 ]]; then
-    initramfs_args+=(--arg=-I --arg=/etc/nsswitch.conf)
-fi
-rpm-ostree initramfs "${initramfs_args[@]}"
+rpm-ostree initramfs --enable --arg=-I --arg=/etc/nsswitch.conf
 
 touch /var/lib/t2-enablement.stamp

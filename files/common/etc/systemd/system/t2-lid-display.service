@@ -1,0 +1,13 @@
+[Unit]
+Description=Blank the internal display while the lid is closed
+Requires=systemd-logind.service
+After=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/t2-lid-display
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

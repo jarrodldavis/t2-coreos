@@ -1,0 +1,55 @@
+#!/usr/bin/bash
+
+set -euo pipefail
+
+backlight_root=/sys/class/backlight
+login1_service=org.freedesktop.login1
+login1_path=/org/freedesktop/login1
+login1_interface=org.freedesktop.login1.Manager
+
+find_display_backlight() {
+    local pattern path
+
+    for pattern in gmux_backlight intel_backlight 'amdgpu_bl*' 'acpi_video*' apple_backlight; do
+        for path in "$backlight_root"/$pattern; do
+            [[ -w "$path/bl_power" ]] || continue
+            printf '%s\n' "$path"
+            return 0
+        done
+    done
+
+    return 1
+}
+
+lid_is_closed() {
+    [[ $(busctl --system get-property "$login1_service" "$login1_path" "$login1_interface" LidClosed) == 'b true' ]]
+}
+
+sync_display() {
+    local backlight power
+
+    if ! backlight=$(find_display_backlight); then
+        echo "t2-lid-display: no supported internal display backlight found" >&2
+        return 0
+    fi
+
+    if lid_is_closed; then
+        power=4
+    else
+        power=0
+    fi
+
+    if [[ $(<"$backlight/bl_power") != "$power" ]]; then
+        printf '%s\n' "$power" > "$backlight/bl_power"
+    fi
+}
+
+sync_display
+
+while true; do
+    if busctl --system wait "$login1_service" "$login1_path" org.freedesktop.DBus.Properties PropertiesChanged >/dev/null; then
+        sync_display
+    else
+        sleep 1
+    fi
+done
