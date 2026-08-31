@@ -23,9 +23,10 @@ hostname: t2mac
 disk:     /dev/nvme0n1
 stream:   stable
 output:   out/
+timezone: builder system timezone
 ```
 
-The generated ISO installs automatically to the configured disk and erases its existing contents. Use `--disk`, `--hostname`, or `--stream` to override the defaults.
+The generated ISO installs automatically to the configured disk and erases its existing contents. Use `--disk`, `--hostname`, `--stream`, or `--timezone` to override the defaults. `--timezone` accepts an IANA timezone such as `America/Denver`.
 
 Build output includes:
 
@@ -43,7 +44,7 @@ The builder selects the newest released FCOS version in the requested stream who
 
 Installed systems keep normal Zincati update behavior through a local Cincinnati filter. The filter preserves Fedora's update graph but hides update edges targeting Fedora majors that the T2 COPR does not support. If the graph or compatibility data cannot be validated, Zincati retries later rather than updating unfiltered.
 
-Zincati uses a configured Saturday 03:00–05:00 maintenance window for update reboots.
+The installed system uses the configured timezone. Zincati follows `/etc/localtime` and allows update reboots Saturday 03:00–05:00 in that timezone.
 
 ## Installation and first boot
 
@@ -55,7 +56,7 @@ The installer configures:
 - a large console font;
 - tty8 for the live journal and tty9 for the systemd debug shell.
 
-On first boot, `t2-enablement.service` installs the T2 kernel and packages, regenerates the initramfs, and reboots into the resulting deployment. Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until this completes.
+On first boot, `t2-enablement.service` disables the startup chime, installs the T2 kernel and packages, regenerates the initramfs, and reboots into the resulting deployment. Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until this completes.
 
 Default T2 packages are:
 

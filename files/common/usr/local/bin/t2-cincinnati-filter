@@ -61,6 +61,16 @@ def fcos_fedora_major(version: str) -> int:
     return int(major)
 
 
+def graph_size(graph: object) -> tuple[int, int]:
+    if not isinstance(graph, dict):
+        raise ValueError("Cincinnati returned a non-object graph")
+    nodes = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise ValueError("Cincinnati graph is missing nodes or edges")
+    return len(nodes), len(edges)
+
+
 def filter_graph(graph: object, supported_majors: set[int]) -> dict[str, object]:
     if not isinstance(graph, dict):
         raise ValueError("Cincinnati returned a non-object graph")
@@ -96,6 +106,8 @@ def filter_graph(graph: object, supported_majors: set[int]) -> dict[str, object]
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        print(f"request: GET {self.path}", flush=True)
+
         if urlsplit(self.path).path != "/v1/graph":
             self.send_error(404)
             return
@@ -103,9 +115,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             supported_majors = get_copr_fedora_majors()
             graph = fetch_json(f"{UPSTREAM}{self.path}")
-            body = json.dumps(filter_graph(graph, supported_majors), separators=(",", ":")).encode()
+            upstream_nodes, upstream_edges = graph_size(graph)
+            filtered = filter_graph(graph, supported_majors)
+            filtered_nodes, filtered_edges = graph_size(filtered)
+            majors = ", ".join(str(major) for major in sorted(supported_majors))
+            print(f"upstream graph: {upstream_nodes} nodes, {upstream_edges} edges", flush=True)
+            print(
+                f"filtered graph: {filtered_nodes} nodes, {filtered_edges} edges "
+                f"({upstream_edges - filtered_edges} removed; supported Fedora: {majors})",
+                flush=True,
+            )
+            body = json.dumps(filtered, separators=(",", ":")).encode()
         except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as error:
-            print(f"t2-cincinnati-filter: {error}", file=sys.stderr, flush=True)
+            print(f"error: {error}", file=sys.stderr, flush=True)
             self.send_error(502)
             return
 

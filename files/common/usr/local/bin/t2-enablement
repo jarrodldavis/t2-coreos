@@ -3,6 +3,26 @@ set -euo pipefail
 
 source /etc/t2-coreos/t2-enablement.conf
 
+mute_startup_chime() {
+    local efivars=/sys/firmware/efi/efivars
+    local startup_mute="$efivars/StartupMute-7c436110-ab2a-4bbb-a880-fe41995c9f82"
+
+    if ! mountpoint -q "$efivars"; then
+        echo "t2-enablement: efivarfs is unavailable; startup chime not muted" >&2
+        return
+    fi
+
+    if [[ -e "$startup_mute" ]]; then
+        chattr -i "$startup_mute" 2>/dev/null || true
+    fi
+
+    if ! printf '\x07\x00\x00\x00\x01' > "$startup_mute"; then
+        echo "t2-enablement: failed to mute startup chime" >&2
+    fi
+}
+
+mute_startup_chime
+
 systemctl stop zincati.service || true
 
 rpm-ostree install -y /etc/t2-coreos/t2-coreos-dracut.rpm

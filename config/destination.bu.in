@@ -16,6 +16,11 @@ boot_device:
         advertisement: @@TANG_ADVERTISEMENT@@
 
 storage:
+  links:
+    - path: /etc/localtime
+      target: @@TIMEZONE_TARGET@@
+      overwrite: true
+
   disks:
     - device: /dev/disk/by-id/coreos-boot-disk
       partitions:

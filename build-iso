@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parent
@@ -79,6 +80,57 @@ def render(path: Path, replacements: dict[str, str]) -> str:
 
 def copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def detect_builder_timezone() -> str:
+    localtime = Path("/etc/localtime")
+    try:
+        resolved = localtime.resolve(strict=True)
+        zoneinfo = Path("/usr/share/zoneinfo")
+        try:
+            timezone = str(resolved.relative_to(zoneinfo))
+            ZoneInfo(timezone)
+            return timezone
+        except ValueError:
+            pass
+    except OSError:
+        pass
+
+    timezone_file = Path("/etc/timezone")
+    if timezone_file.is_file():
+        timezone = timezone_file.read_text().strip()
+        if timezone:
+            try:
+                ZoneInfo(timezone)
+                return timezone
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+
+    if shutil.which("timedatectl"):
+        result = subprocess.run(
+            ["timedatectl", "show", "--property=Timezone", "--value"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        timezone = result.stdout.strip()
+        if result.returncode == 0 and timezone:
+            try:
+                ZoneInfo(timezone)
+                return timezone
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+
+    die("could not determine builder timezone; specify --timezone")
+
+
+def validate_timezone(timezone: str) -> str:
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        die(f"unknown IANA timezone: {timezone}")
+    return timezone
 
 
 def read_ssh_key(value: str) -> str:
@@ -230,6 +282,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disk", default="/dev/nvme0n1", help="automatic installation target")
     parser.add_argument("--stream", choices=("stable", "testing", "next"), default="stable", help="Fedora CoreOS stream")
     parser.add_argument("--hostname", default="t2mac", help="installed hostname")
+    parser.add_argument("--timezone", help="installed IANA timezone; defaults to the builder system timezone")
     parser.add_argument("--out-dir", type=Path, default=Path("out"), help="build and staging directory")
     parser.add_argument(
         "--t2-package",
@@ -330,7 +383,12 @@ def prepare_rootfs(paths: BuildPaths, hostname: str, t2_packages: list[str], rel
 
     repo_path = rootfs / "etc/yum.repos.d/t2linux.repo"
     repo_path.parent.mkdir(parents=True, exist_ok=True)
-    repo_path.write_text(render(ROOT / "templates/t2linux.repo.in", {"COPR_OWNER": COPR_OWNER, "COPR_PROJECT": COPR_PROJECT, "COPR_BASE": COPR_BASE}))
+    repo_path.write_text(
+        render(
+            ROOT / "templates/t2linux.repo.in",
+            {"COPR_OWNER": COPR_OWNER, "COPR_PROJECT": COPR_PROJECT, "COPR_BASE": COPR_BASE},
+        )
+    )
 
     write_enablement_config(rootfs / "etc/t2-coreos/t2-enablement.conf", t2_packages)
 
@@ -366,7 +424,9 @@ def transpile_butane(paths: BuildPaths, template: Path, output_name: str, replac
     return ign_path
 
 
-def build_configs(paths: BuildPaths, ssh_key: str, tang_url: str, tang_advertisement: str, tang_thumbprint: str) -> tuple[Path, Path]:
+def build_configs(
+    paths: BuildPaths, ssh_key: str, tang_url: str, tang_advertisement: str, tang_thumbprint: str, timezone: str
+) -> tuple[Path, Path]:
     destination_ign = transpile_butane(
         paths,
         ROOT / "config/destination.bu.in",
@@ -376,6 +436,7 @@ def build_configs(paths: BuildPaths, ssh_key: str, tang_url: str, tang_advertise
             "TANG_URL": json.dumps(tang_url),
             "TANG_THUMBPRINT": json.dumps(tang_thumbprint),
             "TANG_ADVERTISEMENT": json.dumps(tang_advertisement),
+            "TIMEZONE_TARGET": json.dumps(f"/usr/share/zoneinfo/{timezone}"),
         },
         files_dir=True,
     )
@@ -422,7 +483,7 @@ def build_installer_iso(paths: BuildPaths, base_iso: Path, disk: str, destinatio
 
 
 def print_summary(
-    paths: BuildPaths, output_iso: Path, release: FcosRelease, disk: str, tang_url: str, tang_thumbprint: str
+    paths: BuildPaths, output_iso: Path, release: FcosRelease, disk: str, tang_url: str, tang_thumbprint: str, timezone: str
 ) -> None:
     print()
     print(f"  ISO:    {paths.out_setting / output_iso.name}")
@@ -430,6 +491,7 @@ def print_summary(
     print(f"  Stage:  {paths.out_setting / 'staging'}")
     print(f"  FCOS:   {release.version} (Fedora {release.fedora_major})")
     print(f"  Target: {disk}      -- WILL BE ERASED WITHOUT PROMPTING")
+    print(f"  TZ:     {timezone}")
     print(f"  LUKS:   Tang at {tang_url} (mDNS resolver in initramfs)")
     print(f"  Tang:   {tang_thumbprint}")
     print()
@@ -443,6 +505,7 @@ def main() -> None:
 
     paths = prepare_paths(args.out_dir)
     ssh_key = read_ssh_key(args.ssh_key)
+    timezone = validate_timezone(args.timezone) if args.timezone else detect_builder_timezone()
     t2_packages = list(args.t2_packages or DEFAULT_T2_PACKAGES)
     if "systemd-resolved" not in t2_packages:
         t2_packages.append("systemd-resolved")
@@ -457,9 +520,11 @@ def main() -> None:
     base_iso = download_base_iso(paths, release)
     prepare_rootfs(paths, args.hostname, t2_packages, release)
 
-    destination_ign, live_ign = build_configs(paths, ssh_key, args.tang_url, tang_advertisement, tang_thumbprint)
+    destination_ign, live_ign = build_configs(
+        paths, ssh_key, args.tang_url, tang_advertisement, tang_thumbprint, timezone
+    )
     output_iso = build_installer_iso(paths, base_iso, args.disk, destination_ign, live_ign, args.live_karg)
-    print_summary(paths, output_iso, release, args.disk, args.tang_url, tang_thumbprint)
+    print_summary(paths, output_iso, release, args.disk, args.tang_url, tang_thumbprint, timezone)
 
 
 if __name__ == "__main__":
