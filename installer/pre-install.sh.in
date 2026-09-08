@@ -16,5 +16,4 @@ while read -r swap; do
     swapoff "$swap" 2>/dev/null || true
 done < <(lsblk -nrpo NAME,FSTYPE "$DEV" | awk '$2 == "swap" { print $1 }')
 
-# Stop udev probing while wipefs runs.
 udevadm lock --device="$DEV" wipefs -a "$DEV" 2>/dev/null || wipefs -a "$DEV" 2>/dev/null || true

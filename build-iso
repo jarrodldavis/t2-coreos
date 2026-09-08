@@ -24,7 +24,8 @@ COPR_API = "https://copr.fedorainfracloud.org/api_3/project"
 FCOS_BUILD_BASE = "https://builds.coreos.fedoraproject.org/prod/streams"
 BUTANE_IMG = "quay.io/coreos/butane:release"
 INSTALLER_IMG = "quay.io/coreos/coreos-installer:release"
-DEFAULT_T2_PACKAGES = ["t2fanrd", "tiny-dfr", "t2linux-audio", "systemd-resolved"]
+DEFAULT_T2_PACKAGES = ["t2fanrd", "tiny-dfr", "t2linux-audio"]
+REQUIRED_PACKAGES = ["systemd-resolved", "NetworkManager-wifi"]
 
 
 @dataclass(frozen=True)
@@ -307,10 +308,14 @@ def prepare_paths(out_setting: Path) -> BuildPaths:
 
 
 def run_container(
-    paths: BuildPaths, image: str, command: list[str], *, stdout=None, pull: bool = False
+    paths: BuildPaths,
+    image: str,
+    command: list[str],
+    *,
+    stdout=None,
+    pull: bool = False,
 ) -> subprocess.CompletedProcess:
-    args = ["podman", "run", "--rm"]
-    args += ["--security-opt", "label=disable"]
+    args = ["podman", "run", "--rm", "--security-opt", "label=disable"]
     if pull:
         args.append("--pull=always")
     args += ["-v", f"{paths.out_dir}:/out:z", "-w", paths.stage_arg, image, *command]
@@ -451,10 +456,22 @@ def build_configs(
     return destination_ign, live_ign
 
 
-def build_installer_iso(paths: BuildPaths, base_iso: Path, disk: str, destination_ign: Path, live_ign: Path, live_kargs: list[str]) -> Path:
+def build_installer_iso(
+    paths: BuildPaths,
+    base_iso: Path,
+    disk: str,
+    destination_ign: Path,
+    live_ign: Path,
+    live_kargs: list[str],
+) -> Path:
+    replacements = {"DISK": disk}
     pre_install_path = paths.staging / "pre-install.sh"
-    pre_install_path.write_text(render(ROOT / "installer/pre-install.sh.in", {"DISK": disk}))
+    pre_install_path.write_text(render(ROOT / "installer/pre-install.sh.in", replacements))
     os.chmod(pre_install_path, 0o755)
+
+    post_install_path = paths.staging / "post-install.sh"
+    post_install_path.write_text(render(ROOT / "installer/post-install.sh.in", replacements))
+    os.chmod(post_install_path, 0o755)
 
     output_iso = paths.out_dir / "t2-coreos-installer.iso"
     output_iso.unlink(missing_ok=True)
@@ -464,6 +481,7 @@ def build_installer_iso(paths: BuildPaths, base_iso: Path, disk: str, destinatio
         "--dest-ignition", f"{paths.stage_arg}/{destination_ign.name}",
         "--dest-device", disk,
         "--pre-install", f"{paths.stage_arg}/pre-install.sh",
+        "--post-install", f"{paths.stage_arg}/post-install.sh",
         "--live-karg-append", "rd.driver.blacklist=applesmc",
         "--live-karg-append", "modprobe.blacklist=applesmc",
         "--live-karg-append", "console=tty1",
@@ -507,8 +525,9 @@ def main() -> None:
     ssh_key = read_ssh_key(args.ssh_key)
     timezone = validate_timezone(args.timezone) if args.timezone else detect_builder_timezone()
     t2_packages = list(args.t2_packages or DEFAULT_T2_PACKAGES)
-    if "systemd-resolved" not in t2_packages:
-        t2_packages.append("systemd-resolved")
+    for package in REQUIRED_PACKAGES:
+        if package not in t2_packages:
+            t2_packages.append(package)
 
     log("Fetching Tang advertisement")
     tang_advertisement, tang_thumbprint = fetch_tang_advertisement(args.tang_url)

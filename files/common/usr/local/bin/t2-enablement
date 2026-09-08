@@ -3,6 +3,82 @@ set -euo pipefail
 
 source /etc/t2-coreos/t2-enablement.conf
 
+FIRMWARE_SCRIPT=https://raw.githubusercontent.com/t2linux/wiki/refs/heads/master/docs/tools/firmware.sh
+FIRMWARE_PACKAGES=(curl dmg2img expect kmod python3 sudo util-linux)
+
+install_firmware_tools_live() {
+    local -a missing=()
+    local package
+
+    for package in "${FIRMWARE_PACKAGES[@]}"; do
+        if ! rpm -q "$package" >/dev/null 2>&1; then
+            missing+=("$package")
+        fi
+    done
+
+    if ((${#missing[@]})); then
+        echo "t2-enablement: live-installing firmware tools: ${missing[*]}"
+        rpm-ostree install -y --apply-live "${missing[@]}"
+    fi
+}
+
+fetch_t2_firmware() {
+    local firmware_dir=/var/lib/firmware
+    local firmware_script
+    local result
+
+    firmware_script=$(mktemp)
+    install -d -m 0755 "$firmware_dir/brcm"
+    mount --bind "$firmware_dir" /lib/firmware
+
+    cleanup() {
+        umount /lib/firmware 2>/dev/null || true
+        rm -f "$firmware_script"
+    }
+    trap cleanup EXIT
+
+    curl -fsSL "$FIRMWARE_SCRIPT" -o "$firmware_script"
+    chmod 0755 "$firmware_script"
+
+    set +e
+    FIRMWARE_SCRIPT_PATH="$firmware_script" expect <<'EXPECT'
+set timeout -1
+spawn env HOME=/tmp bash $env(FIRMWARE_SCRIPT_PATH) -iv get_from_online
+
+expect -re {Choose a product to download \(1-[0-9]+\): $}
+set menu $expect_out(buffer)
+
+if {[regexp -line {^([0-9]+)\..*RECOMMENDED.*$} $menu -> choice]} {
+    puts "Selecting recommended macOS recovery image (option $choice)"
+} elseif {[regexp -line {^([0-9]+)\..*Sonoma.*$} $menu -> choice]} {
+    puts "No recommended recovery image found; selecting Sonoma (option $choice)"
+} else {
+    puts stderr "Could not find a recommended or Sonoma recovery image option"
+    exit 1
+}
+
+send -- "$choice\r"
+expect eof
+set result [wait]
+exit [lindex $result 3]
+EXPECT
+    result=$?
+    set -e
+
+    if ((result != 0)); then
+        return "$result"
+    fi
+
+    cleanup
+    trap - EXIT
+
+    if ! compgen -G "$firmware_dir/brcm/brcmfmac*.bin" >/dev/null; then
+        echo "t2-enablement: T2 firmware extraction produced no brcmfmac firmware" >&2
+        return 1
+    fi
+}
+
+
 mute_startup_chime() {
     local efivars=/sys/firmware/efi/efivars
     local startup_mute="$efivars/StartupMute-7c436110-ab2a-4bbb-a880-fe41995c9f82"
@@ -22,8 +98,13 @@ mute_startup_chime() {
 }
 
 mute_startup_chime
-
 systemctl stop zincati.service || true
+
+if [[ ! -e /var/lib/t2-firmware.stamp ]]; then
+    install_firmware_tools_live
+    fetch_t2_firmware
+    touch /var/lib/t2-firmware.stamp
+fi
 
 rpm-ostree install -y /etc/t2-coreos/t2-coreos-dracut.rpm
 

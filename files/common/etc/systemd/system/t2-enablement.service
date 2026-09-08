@@ -11,4 +11,4 @@ Type=oneshot
 ExecStart=/usr/local/bin/t2-enablement
 
 [Install]
-RequiredBy=systemd-user-sessions.service
+WantedBy=systemd-user-sessions.service

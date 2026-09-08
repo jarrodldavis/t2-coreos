@@ -1,6 +1,6 @@
 # t2-coreos
 
-Builds a self-installing Fedora CoreOS ISO for an Intel T2 MacBook Pro. Installation starts from stock Fedora CoreOS, then applies the t2linux kernel and userspace packages with rpm-ostree on first boot.
+Builds a self-installing Fedora CoreOS ISO for Intel T2 MacBook Pros. The ISO installs stock Fedora CoreOS, then enables T2 hardware support with rpm-ostree on the first installed boot.
 
 ## Requirements
 
@@ -28,25 +28,15 @@ timezone: builder system timezone
 
 The generated ISO installs automatically to the configured disk and erases its existing contents. Use `--disk`, `--hostname`, `--stream`, or `--timezone` to override the defaults. `--timezone` accepts an IANA timezone such as `America/Denver`.
 
-Build output includes:
+The installer ISO is written to:
 
 ```text
 out/t2-coreos-installer.iso
-out/t2-fcos.bu
-out/staging/
 ```
 
 Downloaded FCOS ISOs are cached by exact release version.
 
-## Version compatibility
-
-The builder selects the newest released FCOS version in the requested stream whose Fedora major has an enabled x86_64 chroot in `sharpenedblade/t2linux`. The helper RPM is built against that same Fedora major.
-
-Installed systems keep normal Zincati update behavior through a local Cincinnati filter. The filter preserves Fedora's update graph but hides update edges targeting Fedora majors that the T2 COPR does not support. If the graph or compatibility data cannot be validated, Zincati retries later rather than updating unfiltered.
-
-The installed system uses the configured timezone. Zincati follows `/etc/localtime` and allows update reboots Saturday 03:00–05:00 in that timezone.
-
-## Installation and first boot
+## Installation
 
 The installer configures:
 
@@ -54,20 +44,37 @@ The installer configures:
 - mDNS and `systemd-resolved` in the initramfs for `.local` Tang URLs;
 - the configured hostname and SSH key;
 - a large console font;
-- tty8 for the live journal and tty9 for the systemd debug shell.
+- tty8 for the live journal and tty9 for the systemd debug shell;
+- a fresh UEFI NVRAM boot entry for the installed EFI system partition.
 
-On first boot, `t2-enablement.service` disables the startup chime, installs the T2 kernel and packages, regenerates the initramfs, and reboots into the resulting deployment. Local and SSH logins remain behind the normal `systemd-user-sessions` boot gate until this completes.
+The post-install boot entry points to `\EFI\fedora\shimx64.efi`, avoiding stale EFI entries when the installer recreates the partition table.
 
-Default T2 packages are:
+## First boot
+
+`t2-enablement.service` runs before user sessions on the first installed boot. It:
+
+1. fetches the upstream t2linux firmware helper and installs the recommended macOS Wi-Fi/Bluetooth firmware, falling back to Sonoma when necessary;
+2. stages the T2 kernel and packages with rpm-ostree;
+3. regenerates the initramfs;
+4. reboots into the completed deployment.
+
+Wired Internet is required during first boot. If enablement fails, user sessions are still allowed so the system remains accessible for debugging.
+
+Default optional T2 packages are:
 
 ```text
 t2fanrd
 tiny-dfr
 t2linux-audio
-systemd-resolved
 ```
 
-Repeat `--t2-package PACKAGE` to replace the default package set. `systemd-resolved` is always included.
+`systemd-resolved` and `NetworkManager-wifi` are always layered. Repeat `--t2-package PACKAGE` to replace the optional package set.
+
+## Updates
+
+The builder selects the newest released FCOS version in the requested stream whose Fedora major is supported by `sharpenedblade/t2linux`.
+
+Zincati keeps its normal update behavior through a local Cincinnati filter that removes update edges targeting unsupported Fedora majors. Update reboots are allowed Saturday 03:00–05:00 in the configured system timezone.
 
 ## Lid behavior
 
@@ -80,7 +87,7 @@ build-iso       build entry point
 config/         Butane templates
 files/common/   installed system files
 files/dracut/   dracut helper source
-installer/      live installer hook
+installer/      live installer hooks
 packaging/      helper RPM spec
 templates/      source configuration templates
 ```

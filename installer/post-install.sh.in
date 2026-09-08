@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+
+DEV="@@DISK@@"
+if [[ "$DEV" =~ [0-9]$ ]]; then
+    ESP="${DEV}p2"
+else
+    ESP="${DEV}2"
+fi
+
+if [ ! -d /sys/firmware/efi/efivars ]; then
+    echo "post-install: system was not booted in UEFI mode" >&2
+    exit 1
+fi
+
+if ! command -v efibootmgr >/dev/null; then
+    echo "post-install: efibootmgr is not available in the live environment" >&2
+    exit 1
+fi
+
+if ! udevadm wait --timeout=30 "$ESP"; then
+    echo "post-install: EFI system partition $ESP not ready after 30s" >&2
+    exit 1
+fi
+
+partuuid="$(blkid -s PARTUUID -o value "$ESP")"
+if [ -z "$partuuid" ]; then
+    echo "post-install: could not determine PARTUUID for $ESP" >&2
+    exit 1
+fi
+
+while read -r bootnum; do
+    echo "post-install: removing previous Fedora CoreOS EFI boot entry Boot$bootnum"
+    efibootmgr --quiet --delete-bootnum --bootnum "$bootnum"
+done < <(efibootmgr | sed -nE 's/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+Fedora CoreOS$/\1/p')
+
+echo "post-install: creating Fedora CoreOS EFI boot entry for $ESP ($partuuid)"
+efibootmgr \
+    --create \
+    --disk "$DEV" \
+    --part 2 \
+    --label "Fedora CoreOS" \
+    --loader '\EFI\fedora\shimx64.efi'
+
+if ! efibootmgr -v | grep -Fi "$partuuid" | grep -Fqi '\EFI\fedora\shimx64.efi'; then
+    echo "post-install: EFI boot entry was created but could not be verified" >&2
+    exit 1
+fi
